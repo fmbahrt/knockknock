@@ -18,7 +18,7 @@ directly between them.
 
 ```
 .
-├── mise.toml                 # pinned Go, Rust and just versions
+├── mise.toml                 # pinned Go, Rust, Python and just versions
 ├── justfile                  # top-level tasks; delegates to the modules below
 ├── docs/
 │   ├── design.md             # design spec
@@ -30,7 +30,8 @@ directly between them.
 │       ├── protocol/         # packet encoding/decoding, lobby IDs
 │       ├── auth/             # HMAC tags, replay window
 │       ├── ratelimit/        # per-IP token bucket
-│       └── registry/         # clients, lobbies, sessions
+│       ├── registry/         # clients, lobbies, sessions, stats snapshot
+│       └── dashboard/        # web view of lobbies and connection stats
 └── client/                   # Cargo workspace
     └── knockknock/           # library crate
         ├── src/protocol.rs   # packet encoding/decoding
@@ -39,9 +40,12 @@ directly between them.
         ├── src/pair.rs       # candidate-pair state machine
         ├── src/session.rs    # session typestate machine (sans-IO)
         ├── src/agent.rs      # registration, lobby, session routing (sans-IO)
+        ├── src/stats.rs      # PING/PONG RTT, jitter and loss
         ├── src/client.rs     # std::net::UdpSocket driver
         ├── src/sim.rs        # NAT/loss simulation tests
-        └── examples/         # host.rs, join.rs
+        └── examples/         # host.rs, join.rs, bridge.rs (stdin/stdout driver)
+scripts/
+└── datatest.py               # traffic tests over real connections (stdlib only)
 ```
 
 ## Getting started
@@ -53,7 +57,29 @@ mise install     # installs Go, Rust and just at the pinned versions
 just             # list tasks
 just check       # lint + test everything
 just demo        # local server + a host + two joiners
+just live        # same, long-running, with the dashboard at http://127.0.0.1:8080
 ```
+
+## Testing data over real connections
+
+`scripts/datatest.py` starts a local server (or uses `--server`), a host and
+N joiners. Each peer is the real Rust client, driven through the `bridge`
+example.
+
+```sh
+just datatest bench                                   # echo test: loss, dupes, corruption, RTT
+just datatest --players 4 bench --count 2000 --size 1000 --rate 250
+just datatest chat                                    # type messages between host and players
+just datatest --server 1.2.3.4:7777 bench             # across real NATs
+just datatest --dashboard 127.0.0.1:8080 chat         # watch it on the dashboard
+```
+
+`bench` checks that a 1168-byte payload round-trips and that 1169 bytes is
+rejected. It then sends paced, verifiable payloads that the host echoes back,
+and reports loss, duplicates, corruption and round-trip percentiles, followed by
+the library's own ping stats. The harness itself (Python, plus hex over pipes)
+tops out at roughly 2,000 echoed messages per second on a laptop; beyond that,
+its own queues add latency and loss. That is far above typical game rates.
 
 To run the pieces by hand:
 
@@ -81,6 +107,13 @@ loop {
 `Agent` instead. It is sans-IO: you feed it datagrams and the current time, and
 it hands back datagrams to send and events.
 
+## Dashboard
+
+The rendezvous server serves a stats page (`-http`, default
+`127.0.0.1:8080`). It lists every lobby, and for each joiner shows its state,
+path type, RTT, jitter and loss, as measured by the host's pings and reported
+every 5 s. It shows lobby IDs, so keep it private.
+
 ## Godot
 
 Game traffic stays on the knockknock socket as authenticated `DATA` packets.
@@ -93,7 +126,7 @@ with that work.
 
 ## Limitations
 
-See [design.md §12](docs/design.md#12-known-limitations). In short: no relay
+See [design.md §13](docs/design.md#13-known-limitations). In short: no relay
 yet, so two symmetric NATs fail with `NoPath`. There is no signalling
 encryption (the threat model is off-path attackers), and only the primary
 network interface is used as a host candidate.

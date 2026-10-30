@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>knockknock · lobbies</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+    --good: #1f9d55; --warn: #c27c0e; --bad: #d64545; --accent: #3b5bdb;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --card: #1b2029; --text: #e6e9ef; --muted: #8b93a5; --line: #2a303c;
+      --good: #4cc38a; --warn: #e5a93b; --bad: #f07171; --accent: #8ea4ff;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 20px; margin: 0; }
+  .muted { color: var(--muted); }
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0 24px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .stat .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .stat .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .lobby { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 16px; overflow: hidden; }
+  .lobby-head { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: baseline; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .lobby-id { font: 600 18px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; color: var(--accent); }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 8px 16px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 12px; font-weight: 500; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; }
+  code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .empty { padding: 32px 16px; text-align: center; color: var(--muted); }
+  #error { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>knockknock lobbies</h1>
+    <span class="muted"><span id="error"></span> <span id="updated">loading…</span></span>
+  </header>
+  <section class="summary">
+    <div class="stat"><div class="label">Lobbies</div><div class="value" id="s-lobbies">–</div></div>
+    <div class="stat"><div class="label">Players in lobbies</div><div class="value" id="s-players">–</div></div>
+    <div class="stat"><div class="label">Connected</div><div class="value" id="s-connected">–</div></div>
+    <div class="stat"><div class="label">Registered clients</div><div class="value" id="s-clients">–</div></div>
+    <div class="stat"><div class="label">Uptime</div><div class="value" id="s-uptime">–</div></div>
+  </section>
+  <section id="lobbies"></section>
+</main>
+<script>
+"use strict";
+
+const REFRESH_MS = 2000;
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  for (const c of children) e.append(c ?? "");
+  return e;
+}
+
+function duration(s) {
+  if (s < 60) return Math.floor(s) + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + Math.floor(s % 60) + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor(s % 86400 / 3600) + "h";
+}
+
+// Thresholds are rough guides for real-time games.
+function grade(v, ok, meh) { return v == null ? "" : v <= ok ? "good" : v <= meh ? "warn" : "bad"; }
+
+function metric(v, unit, cls) {
+  return v == null ? el("td", { class: "num muted" }, "–")
+                   : el("td", { class: "num " + cls }, v.toFixed(1) + " " + unit);
+}
+
+function stateBadge(state) {
+  if (!state) return el("span", { class: "muted" }, "no report yet");
+  const cls = { connected: "good", connecting: "warn", disconnected: "bad" }[state] || "";
+  return el("span", { class: "badge " + cls }, state);
+}
+
+function sessionRow(s) {
+  return el("tr", {},
+    el("td", {}, el("code", {}, s.joiner)),
+    el("td", {}, stateBadge(s.state)),
+    el("td", {}, s.path || el("span", { class: "muted" }, "–")),
+    metric(s.rttMs, "ms", grade(s.rttMs, 60, 150)),
+    metric(s.jitterMs, "ms", grade(s.jitterMs, 10, 30)),
+    metric(s.lossPercent, "%", grade(s.lossPercent, 1, 5)),
+    el("td", { class: "num muted" }, s.state ? duration(s.reportAge) + " ago" : "–"),
+    el("td", { class: "num muted" }, duration(s.age)),
+  );
+}
+
+function lobbyCard(l, maxLobby) {
+  const head = el("div", { class: "lobby-head" },
+    el("span", { class: "lobby-id" }, l.id),
+    el("span", { class: "muted" }, "host ", el("code", {}, l.host)),
+    el("span", { class: "muted" }, `${l.sessions.length + 1}/${maxLobby} players`),
+    el("span", { class: "muted" }, "open " + duration(l.age)),
+  );
+  if (l.sessions.length === 0) {
+    return el("article", { class: "lobby" }, head, el("div", { class: "empty" }, "Waiting for players"));
+  }
+  const th = (t, num) => el("th", num ? { class: "num" } : {}, t);
+  const table = el("table", {},
+    el("thead", {}, el("tr", {},
+      th("Joiner"), th("State"), th("Path"), th("RTT", 1), th("Jitter", 1), th("Loss", 1), th("Reported", 1), th("Joined", 1))),
+    el("tbody", {}, ...l.sessions.map(sessionRow)),
+  );
+  return el("article", { class: "lobby" }, head, el("div", { class: "scroll" }, table));
+}
+
+function render(snap) {
+  const sessions = snap.lobbies.flatMap(l => l.sessions);
+  document.getElementById("s-lobbies").textContent = snap.lobbies.length;
+  document.getElementById("s-players").textContent = snap.lobbies.length + sessions.length;
+  document.getElementById("s-connected").textContent = sessions.filter(s => s.state === "connected").length;
+  document.getElementById("s-clients").textContent = snap.clients;
+  document.getElementById("s-uptime").textContent = duration(snap.uptime);
+
+  const root = document.getElementById("lobbies");
+  root.replaceChildren(...(snap.lobbies.length
+    ? snap.lobbies.map(l => lobbyCard(l, snap.maxLobby))
+    : [el("div", { class: "lobby empty" }, "No open lobbies")]));
+  document.getElementById("updated").textContent = "updated " + new Date(snap.time).toLocaleTimeString();
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("api/lobbies", { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status + " " + res.statusText);
+    render(await res.json());
+    document.getElementById("error").textContent = "";
+  } catch (err) {
+    document.getElementById("error").textContent = "refresh failed: " + err.message + " ·";
+  } finally {
+    setTimeout(refresh, REFRESH_MS);
+  }
+}
+refresh();
+</script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-//! Opens a lobby and greets every player that joins.
+//! Opens a lobby, greets every player that joins, and prints path stats.
 //!
 //!     cargo run --example host -- <server-addr> [players]
 //!
@@ -7,8 +7,11 @@
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
-use knockknock::{Client, Event, State};
+use knockknock::{Client, Event, SessionId, State};
+
+const STATS_EVERY: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -41,9 +44,11 @@ fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::E
         .ok_or("server address did not resolve")?;
     let mut client = Client::host(server)?;
     let mut greeted = 0;
+    let mut sessions: Vec<SessionId> = Vec::new();
+    let mut next_stats = Instant::now() + STATS_EVERY;
 
     while players.is_none_or(|n| greeted < n) {
-        match client.wait(None)? {
+        match client.wait(Some(next_stats.saturating_duration_since(Instant::now())))? {
             Some(Event::Registered {
                 lobby: Some(lobby),
                 observed,
@@ -55,9 +60,17 @@ fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::E
                 state: State::Connected { addr },
             }) => {
                 println!("[host] session {id:016x} connected via {addr}");
+                if !sessions.contains(&id) {
+                    sessions.push(id);
+                }
                 client.send(id, b"welcome to the lobby")?;
             }
-            Some(Event::Session { id, state }) => println!("[host] session {id:016x}: {state:?}"),
+            Some(Event::Session { id, state }) => {
+                println!("[host] session {id:016x}: {state:?}");
+                if matches!(state, State::Failed(_) | State::Closed) {
+                    sessions.retain(|&s| s != id);
+                }
+            }
             Some(Event::Data { session, data }) => {
                 println!(
                     "[host] {session:016x} says: {}",
@@ -67,6 +80,23 @@ fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::E
             }
             Some(Event::ServerError(code)) => eprintln!("[host] server error: {code}"),
             Some(Event::Registered { .. }) | None => {}
+        }
+
+        if Instant::now() >= next_stats {
+            next_stats += STATS_EVERY;
+            for &id in &sessions {
+                if let Some(st) = client.stats(id) {
+                    let ms = |d: Option<Duration>| {
+                        d.map_or("-".into(), |d| format!("{:.1}ms", d.as_secs_f64() * 1e3))
+                    };
+                    println!(
+                        "[host] {id:016x}: rtt {} jitter {} loss {:.0}%",
+                        ms(st.rtt),
+                        ms(st.jitter),
+                        st.loss * 100.0
+                    );
+                }
+            }
         }
     }
     client.close()?;

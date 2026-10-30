@@ -1,6 +1,9 @@
 //! Joins a lobby, says hello to the host and waits for its greeting.
 //!
-//!     cargo run --example join -- <server-addr> <lobby-id> [name]
+//!     cargo run --example join -- <server-addr> <lobby-id> [name] [--stay]
+//!
+//! With `--stay` the player stays connected after the greeting (until
+//! Ctrl-C), so the host keeps measuring and reporting the connection.
 
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -10,16 +13,20 @@ use std::time::Duration;
 use knockknock::{Client, Event, LobbyId, State};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let stay = args.last().is_some_and(|a| a == "--stay");
+    if stay {
+        args.pop();
+    }
     let (server, lobby, name) = match args.as_slice() {
         [server, lobby] => (server, lobby, "player"),
         [server, lobby, name] => (server, lobby, name.as_str()),
         _ => {
-            eprintln!("usage: join <server-addr> <lobby-id> [name]");
+            eprintln!("usage: join <server-addr> <lobby-id> [name] [--stay]");
             return ExitCode::FAILURE;
         }
     };
-    match run(server, lobby, name) {
+    match run(server, lobby, name, stay) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("[{name}] error: {e}");
@@ -28,16 +35,24 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(server: &str, lobby: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    server: &str,
+    lobby: &str,
+    name: &str,
+    stay: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let server: SocketAddr = server
         .to_socket_addrs()?
         .next()
         .ok_or("server address did not resolve")?;
     let lobby: LobbyId = lobby.parse()?;
     let mut client = Client::join(server, lobby)?;
+    let mut connected = false;
 
     loop {
-        let Some(event) = client.wait(Some(Duration::from_secs(15)))? else {
+        // Only time out while connecting; once connected, wait for the host.
+        let timeout = (!connected).then_some(Duration::from_secs(15));
+        let Some(event) = client.wait(timeout)? else {
             return Err("timed out".into());
         };
         match event {
@@ -49,17 +64,27 @@ fn run(server: &str, lobby: &str, name: &str) -> Result<(), Box<dyn std::error::
                 state: State::Connected { addr },
             } => {
                 println!("[{name}] connected to host via {addr}");
+                connected = true;
                 client.send(id, format!("hello from {name}").as_bytes())?;
             }
             Event::Session {
                 state: State::Failed(reason),
                 ..
             } => return Err(format!("failed: {reason:?}").into()),
+            Event::Session {
+                state: State::Closed,
+                ..
+            } => {
+                println!("[{name}] host closed the session");
+                return Ok(());
+            }
             Event::Session { state, .. } => println!("[{name}] {state:?}"),
             Event::Data { data, .. } => {
                 println!("[{name}] host says: {}", String::from_utf8_lossy(&data));
-                client.close()?;
-                return Ok(());
+                if !stay {
+                    client.close()?;
+                    return Ok(());
+                }
             }
             Event::ServerError(code) => return Err(format!("server: {code}").into()),
         }

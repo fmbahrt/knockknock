@@ -259,6 +259,10 @@ impl Sim {
         }
     }
 
+    fn stats(&self, i: usize) -> crate::SessionStats {
+        self.sessions[i].as_ref().unwrap().stats(self.now).unwrap()
+    }
+
     fn send_data(&mut self, i: usize, data: &[u8]) {
         let mut out = Vec::new();
         let now = self.now;
@@ -520,6 +524,32 @@ fn unrecovered_outage_fails() {
     let limit = cfg.disconnect_timeout + cfg.recovery_timeout + Duration::from_secs(1);
     assert!(sim.run_until(limit, |s| s.both(failed)));
     assert!(sim.elapsed() > cfg.disconnect_timeout);
+}
+
+#[test]
+fn pings_measure_rtt_and_loss() {
+    let mut sim = two_nats(
+        Nat::port_restricted("203.0.113.1"),
+        Nat::port_restricted("203.0.113.2"),
+    );
+    assert!(sim.run_until(Duration::from_secs(3), |s| s.both(connected)));
+    sim.run_until(Duration::from_secs(5), |_| false);
+
+    // Each direction takes 5 ms, delivered on a 10 ms step.
+    let stats = sim.stats(HOST);
+    let rtt = stats.rtt.expect("rtt measured");
+    assert!(
+        rtt >= Duration::from_millis(10) && rtt <= Duration::from_millis(30),
+        "rtt {rtt:?}"
+    );
+    assert_eq!(stats.loss, 0.0);
+    assert_eq!(stats.path, Some(CandidateKind::ServerReflexive));
+
+    sim.loss = 0.5;
+    sim.run_until(Duration::from_secs(12), |_| false);
+    let loss = sim.stats(HOST).loss;
+    // A ping is lost if either it or its pong is: 1 - 0.5² = 75% expected.
+    assert!((0.5..=0.95).contains(&loss), "loss {loss}");
 }
 
 #[test]

@@ -51,6 +51,7 @@ Only these packets are unauthenticated (`id` = 0, `auth` = zeros):
 | `Candidates` | `count u8` (≤ 8), then `count × Candidate` |
 | `LobbyId` | 6 bytes, each from `23456789ABCDEFGHJKMNPQRSTUVWXYZ`; all zeros = none |
 | `Key` | 16 bytes |
+| `SessionStats` | `session_id u64`, `state u8` (`1` connecting, `2` connected, `3` disconnected), `path u8` (candidate kind of the selected path, `0` = none), `rtt_us u32`, `rttvar_us u32` (both `0xFFFFFFFF` = not measured), `loss_permille u16` (≤ 1000). 20 bytes. |
 
 ## Messages
 
@@ -64,6 +65,7 @@ Only these packets are unauthenticated (`id` = 0, `auth` = zeros):
 | `0x04` | `PEER_INFO` | S→C | client ID | `session_id u64`, `role u8` (`1` controlling/host, `2` controlled/joiner), `session_key Key`, `Candidates` (the other peer's) |
 | `0x05` | `ERROR` | S→C | client ID or 0 | `code u8`, `ref_seq u32` (the `seq` of the offending request) |
 | `0x06` | `CLOSE` | C→S | client ID | `reason u8`; leaves the server (a host closes its lobby). Never answered. |
+| `0x07` | `STATS` | C→S | client ID | `count u8` (≤ 16), `count × SessionStats`. Sent by hosts every few seconds. Entries for sessions outside the sender's lobby are ignored. Never answered. |
 
 - **`REGISTER` padding:** the payload must be at least 51 bytes, the largest
   possible `REGISTERED` payload. Every byte after the candidates must be zero.
@@ -81,6 +83,8 @@ Only these packets are unauthenticated (`id` = 0, `auth` = zeros):
 | `0x06` | `CLOSE` | `reason u8`; ends the session |
 | `0x10` | `CHECK` | `txid u64`, `flags u8` (bit 0 = `NOMINATE`) |
 | `0x11` | `CHECK_ACK` | `txid u64`, `flags u8` (echoed), `observed Endpoint` (the check's source address as seen by the responder) |
+| `0x12` | `PING` | `id u32`; answered with `PONG` in any state that has session credentials |
+| `0x13` | `PONG` | `id u32` (echoed) |
 | `0x20` | `DATA` | 0–1168 opaque bytes |
 | `0x30`–`0x3F` | reserved for relay | |
 

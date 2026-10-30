@@ -12,6 +12,7 @@ pub const VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 32;
 pub const MAX_CANDIDATES: usize = 8;
 pub const MAX_DATA_LEN: usize = 1168;
+pub const MAX_STATS: usize = 16;
 pub const LOBBY_ID_LEN: usize = 6;
 /// The largest possible REGISTERED payload. REGISTER is padded to at least
 /// this size so the server never amplifies.
@@ -23,8 +24,11 @@ const TYPE_JOIN: u8 = 0x03;
 const TYPE_PEER_INFO: u8 = 0x04;
 const TYPE_ERROR: u8 = 0x05;
 const TYPE_CLOSE: u8 = 0x06;
+const TYPE_STATS: u8 = 0x07;
 const TYPE_CHECK: u8 = 0x10;
 const TYPE_CHECK_ACK: u8 = 0x11;
+const TYPE_PING: u8 = 0x12;
+const TYPE_PONG: u8 = 0x13;
 const TYPE_DATA: u8 = 0x20;
 
 const FLAG_HOST: u8 = 1;
@@ -70,6 +74,8 @@ pub enum Message {
     Close {
         reason: u8,
     },
+    /// A host's report on its sessions. Never answered.
+    Stats(Vec<StatsEntry>),
     Check {
         txid: u64,
         nominate: bool,
@@ -79,8 +85,40 @@ pub enum Message {
         nominate: bool,
         observed: SocketAddr,
     },
+    Ping {
+        id: u32,
+    },
+    Pong {
+        id: u32,
+    },
     Data(Vec<u8>),
 }
+
+/// A session's state as reported to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportedState {
+    Connecting = 1,
+    Connected = 2,
+    Disconnected = 3,
+}
+
+/// One entry of a STATS report: the host's view of the path to one joiner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsEntry {
+    pub session_id: u64,
+    pub state: ReportedState,
+    /// Remote candidate kind of the selected path.
+    pub path: Option<CandidateKind>,
+    /// Smoothed RTT in microseconds.
+    pub rtt_us: Option<u32>,
+    /// RTT variation (jitter) in microseconds.
+    pub rttvar_us: Option<u32>,
+    /// Share of recent pings that went unanswered, 0–1000.
+    pub loss_permille: u16,
+}
+
+/// Encodes an unmeasured RTT.
+const RTT_UNKNOWN: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -275,6 +313,13 @@ impl Packet {
                 ref_seq: u32::from_be_bytes(r.take()?),
             },
             TYPE_CLOSE => Message::Close { reason: r.u8()? },
+            TYPE_STATS => Message::Stats(r.stats()?),
+            TYPE_PING => Message::Ping {
+                id: u32::from_be_bytes(r.take()?),
+            },
+            TYPE_PONG => Message::Pong {
+                id: u32::from_be_bytes(r.take()?),
+            },
             TYPE_CHECK => Message::Check {
                 txid: r.u64()?,
                 nominate: r.u8()? & FLAG_NOMINATE != 0,
@@ -314,6 +359,9 @@ impl Message {
             Self::PeerInfo { .. } => TYPE_PEER_INFO,
             Self::Error { .. } => TYPE_ERROR,
             Self::Close { .. } => TYPE_CLOSE,
+            Self::Stats(_) => TYPE_STATS,
+            Self::Ping { .. } => TYPE_PING,
+            Self::Pong { .. } => TYPE_PONG,
             Self::Check { .. } => TYPE_CHECK,
             Self::CheckAck { .. } => TYPE_CHECK_ACK,
             Self::Data(_) => TYPE_DATA,
@@ -367,6 +415,21 @@ impl Message {
                 buf.extend_from_slice(&ref_seq.to_be_bytes());
             }
             Self::Close { reason } => buf.push(*reason),
+            Self::Stats(entries) => {
+                if entries.len() > MAX_STATS {
+                    return Err(ProtocolError::BadField);
+                }
+                buf.push(entries.len() as u8);
+                for e in entries {
+                    buf.extend_from_slice(&e.session_id.to_be_bytes());
+                    buf.push(e.state as u8);
+                    buf.push(e.path.map_or(0, u8::from));
+                    buf.extend_from_slice(&e.rtt_us.unwrap_or(RTT_UNKNOWN).to_be_bytes());
+                    buf.extend_from_slice(&e.rttvar_us.unwrap_or(RTT_UNKNOWN).to_be_bytes());
+                    buf.extend_from_slice(&e.loss_permille.min(1000).to_be_bytes());
+                }
+            }
+            Self::Ping { id } | Self::Pong { id } => buf.extend_from_slice(&id.to_be_bytes()),
             Self::Check { txid, nominate } => {
                 buf.extend_from_slice(&txid.to_be_bytes());
                 buf.push(if *nominate { FLAG_NOMINATE } else { 0 });
@@ -445,6 +508,43 @@ impl Reader<'_> {
         };
         let port = u16::from_be_bytes(self.take()?);
         Ok(SocketAddr::new(ip, port))
+    }
+
+    fn stats(&mut self) -> Result<Vec<StatsEntry>, ProtocolError> {
+        let n = self.u8()? as usize;
+        if n > MAX_STATS {
+            return Err(ProtocolError::BadField);
+        }
+        let known = |v: u32| (v != RTT_UNKNOWN).then_some(v);
+        (0..n)
+            .map(|_| {
+                let session_id = self.u64()?;
+                let state = match self.u8()? {
+                    1 => ReportedState::Connecting,
+                    2 => ReportedState::Connected,
+                    3 => ReportedState::Disconnected,
+                    _ => return Err(ProtocolError::BadField),
+                };
+                let path = match self.u8()? {
+                    0 => None,
+                    k => Some(CandidateKind::try_from(k)?),
+                };
+                let rtt_us = known(u32::from_be_bytes(self.take()?));
+                let rttvar_us = known(u32::from_be_bytes(self.take()?));
+                let loss_permille = u16::from_be_bytes(self.take()?);
+                if loss_permille > 1000 {
+                    return Err(ProtocolError::BadField);
+                }
+                Ok(StatsEntry {
+                    session_id,
+                    state,
+                    path,
+                    rtt_us,
+                    rttvar_us,
+                    loss_permille,
+                })
+            })
+            .collect()
     }
 
     fn candidates(&mut self) -> Result<Vec<Candidate>, ProtocolError> {
@@ -580,6 +680,42 @@ mod tests {
                 "data",
                 p(SESSION, 8, Message::Data(b"hello".to_vec())),
                 Some(Dir::HostToJoiner),
+            ),
+            (
+                "stats",
+                p(
+                    CLIENT,
+                    9,
+                    Message::Stats(vec![
+                        StatsEntry {
+                            session_id: SESSION,
+                            state: ReportedState::Connected,
+                            path: Some(CandidateKind::ServerReflexive),
+                            rtt_us: Some(23500),
+                            rttvar_us: Some(1200),
+                            loss_permille: 25,
+                        },
+                        StatsEntry {
+                            session_id: 0x0102_0304_0506_0708,
+                            state: ReportedState::Connecting,
+                            path: None,
+                            rtt_us: None,
+                            rttvar_us: None,
+                            loss_permille: 0,
+                        },
+                    ]),
+                ),
+                Some(Dir::ClientToServer),
+            ),
+            (
+                "ping",
+                p(SESSION, 10, Message::Ping { id: 0xdead_beef }),
+                Some(Dir::HostToJoiner),
+            ),
+            (
+                "pong",
+                p(SESSION, 11, Message::Pong { id: 0xdead_beef }),
+                Some(Dir::JoinerToHost),
             ),
         ]
     }

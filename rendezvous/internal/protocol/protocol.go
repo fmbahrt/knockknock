@@ -16,6 +16,9 @@ const (
 	HeaderLen          = 32
 	MaxCandidates      = 8
 	MaxDataLen         = 1168
+	MaxStats           = 16
+	// RTTUnknown marks an RTT that has not been measured yet.
+	RTTUnknown = ^uint32(0)
 	// MinRegisterPayload is the largest possible REGISTERED payload. REGISTER
 	// is padded to at least this size so the server never amplifies.
 	MinRegisterPayload = 8 + 16 + 19 + LobbyIDLen + 2
@@ -32,8 +35,11 @@ const (
 	TypePeerInfo   Type = 0x04
 	TypeError      Type = 0x05
 	TypeClose      Type = 0x06
+	TypeStats      Type = 0x07
 	TypeCheck      Type = 0x10
 	TypeCheckAck   Type = 0x11
+	TypePing       Type = 0x12
+	TypePong       Type = 0x13
 	TypeData       Type = 0x20
 )
 
@@ -61,6 +67,27 @@ const (
 	KindRelay           CandidateKind = 3
 	KindPeerReflexive   CandidateKind = 4
 )
+
+// SessionState is a session's state as reported by its host.
+type SessionState byte
+
+const (
+	StateConnecting   SessionState = 1
+	StateConnected    SessionState = 2
+	StateDisconnected SessionState = 3
+)
+
+// SessionStats is one entry of a STATS report: the host's view of the path
+// to one joiner.
+type SessionStats struct {
+	SessionID uint64
+	State     SessionState
+	// PathKind is the remote candidate kind of the selected path, or 0.
+	PathKind     CandidateKind
+	RTTMicros    uint32 // smoothed RTT, or RTTUnknown
+	RTTVarMicros uint32 // RTT variation (jitter), or RTTUnknown
+	LossPermille uint16 // share of recent pings that went unanswered
+}
 
 type Candidate struct {
 	Kind CandidateKind
@@ -117,6 +144,19 @@ type Close struct {
 	Reason byte
 }
 
+// Stats is sent by a host to report its sessions. It is never answered.
+type Stats struct {
+	Sessions []SessionStats
+}
+
+type Ping struct {
+	ID uint32
+}
+
+type Pong struct {
+	ID uint32
+}
+
 type Check struct {
 	TxID     uint64
 	Nominate bool
@@ -138,6 +178,9 @@ func (*Join) Type() Type       { return TypeJoin }
 func (*PeerInfo) Type() Type   { return TypePeerInfo }
 func (*Error) Type() Type      { return TypeError }
 func (*Close) Type() Type      { return TypeClose }
+func (*Stats) Type() Type      { return TypeStats }
+func (*Ping) Type() Type       { return TypePing }
+func (*Pong) Type() Type       { return TypePong }
 func (*Check) Type() Type      { return TypeCheck }
 func (*CheckAck) Type() Type   { return TypeCheckAck }
 func (*Data) Type() Type       { return TypeData }
@@ -215,6 +258,22 @@ func appendPayload(b []byte, m Message) ([]byte, error) {
 		b = binary.BigEndian.AppendUint32(b, m.RefSeq)
 	case *Close:
 		b = append(b, m.Reason)
+	case *Stats:
+		if len(m.Sessions) > MaxStats {
+			return nil, fmt.Errorf("%w: too many stats entries", ErrBadField)
+		}
+		b = append(b, byte(len(m.Sessions)))
+		for _, st := range m.Sessions {
+			b = binary.BigEndian.AppendUint64(b, st.SessionID)
+			b = append(b, byte(st.State), byte(st.PathKind))
+			b = binary.BigEndian.AppendUint32(b, st.RTTMicros)
+			b = binary.BigEndian.AppendUint32(b, st.RTTVarMicros)
+			b = binary.BigEndian.AppendUint16(b, st.LossPermille)
+		}
+	case *Ping:
+		b = binary.BigEndian.AppendUint32(b, m.ID)
+	case *Pong:
+		b = binary.BigEndian.AppendUint32(b, m.ID)
 	case *Check:
 		b = binary.BigEndian.AppendUint64(b, m.TxID)
 		b = append(b, boolFlag(m.Nominate, flagNominate))
@@ -284,6 +343,12 @@ func Decode(b []byte) (Packet, error) {
 		p.Msg = &Error{Code: ErrorCode(r.u8()), RefSeq: r.u32()}
 	case TypeClose:
 		p.Msg = &Close{Reason: r.u8()}
+	case TypeStats:
+		p.Msg = &Stats{Sessions: r.stats()}
+	case TypePing:
+		p.Msg = &Ping{ID: r.u32()}
+	case TypePong:
+		p.Msg = &Pong{ID: r.u32()}
 	case TypeCheck:
 		p.Msg = &Check{TxID: r.u64(), Nominate: r.u8()&flagNominate != 0}
 	case TypeCheckAck:
@@ -421,6 +486,31 @@ func (r *reader) candidates() []Candidate {
 		cs = append(cs, Candidate{Kind: kind, Addr: r.endpoint()})
 	}
 	return cs
+}
+
+func (r *reader) stats() []SessionStats {
+	n := int(r.u8())
+	if n > MaxStats {
+		r.fail(ErrBadField)
+		return nil
+	}
+	ss := make([]SessionStats, 0, n)
+	for range n {
+		st := SessionStats{
+			SessionID:    r.u64(),
+			State:        SessionState(r.u8()),
+			PathKind:     CandidateKind(r.u8()),
+			RTTMicros:    r.u32(),
+			RTTVarMicros: r.u32(),
+			LossPermille: r.u16(),
+		}
+		if st.State < StateConnecting || st.State > StateDisconnected ||
+			st.PathKind > KindPeerReflexive || st.LossPermille > 1000 {
+			r.fail(ErrBadField)
+		}
+		ss = append(ss, st)
+	}
+	return ss
 }
 
 func (r *reader) lobbyID() LobbyID {

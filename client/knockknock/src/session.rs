@@ -16,6 +16,7 @@ use crate::auth::{self, Dir, Key, ReplayWindow};
 use crate::candidate::{Candidate, CandidateKind};
 use crate::pair::{CandidatePair, PairState};
 use crate::protocol::{self, MAX_CANDIDATES, MAX_DATA_LEN, Message, Packet, Role};
+use crate::stats::{Pinger, SessionStats};
 use crate::{Config, Error};
 
 /// The public view of a session's state.
@@ -184,6 +185,10 @@ impl Checker {
             .is_some_and(|p| p.ack_received(txid, now, cfg))
     }
 
+    fn pair(&self, addr: SocketAddr) -> Option<&CandidatePair> {
+        self.pairs.iter().find(|p| p.addr() == addr)
+    }
+
     fn nominated(&self, addr: SocketAddr) -> bool {
         self.nomination.is_some_and(|n| n.addr == addr)
     }
@@ -289,6 +294,7 @@ pub(crate) struct Connected {
     path: SocketAddr,
     last_recv: Instant,
     last_sent: Instant,
+    pinger: Pinger,
 }
 
 #[derive(Debug)]
@@ -297,6 +303,8 @@ pub(crate) struct Disconnected {
     checker: Checker,
     path: SocketAddr,
     deadline: Instant,
+    /// Kept so stats survive a recovered connection.
+    pinger: Pinger,
 }
 
 #[derive(Debug)]
@@ -341,6 +349,7 @@ impl From<(Session<Gathering>, Link, Vec<Candidate>, Instant)> for Session<Conne
 
 impl From<(Session<Connecting>, SocketAddr, Instant)> for Session<Connected> {
     fn from((s, path, now): (Session<Connecting>, SocketAddr, Instant)) -> Self {
+        let seed = s.state.checker.pair(path).and_then(|p| p.rtt);
         Self {
             cfg: s.cfg,
             state: Connected {
@@ -349,6 +358,7 @@ impl From<(Session<Connecting>, SocketAddr, Instant)> for Session<Connected> {
                 path,
                 last_recv: now,
                 last_sent: now,
+                pinger: Pinger::new(now, seed),
             },
         }
     }
@@ -369,6 +379,7 @@ impl From<(Session<Connected>, Instant)> for Session<Disconnected> {
             link,
             mut checker,
             path,
+            pinger,
             ..
         } = s.state;
         checker.reset();
@@ -378,6 +389,7 @@ impl From<(Session<Connected>, Instant)> for Session<Disconnected> {
                 checker,
                 path,
                 deadline: now + s.cfg.recovery_timeout,
+                pinger,
             },
             cfg: s.cfg,
         }
@@ -386,6 +398,8 @@ impl From<(Session<Connected>, Instant)> for Session<Disconnected> {
 
 impl From<(Session<Disconnected>, SocketAddr, Instant)> for Session<Connected> {
     fn from((s, path, now): (Session<Disconnected>, SocketAddr, Instant)) -> Self {
+        let mut pinger = s.state.pinger;
+        pinger.resume(now);
         Self {
             cfg: s.cfg,
             state: Connected {
@@ -394,6 +408,7 @@ impl From<(Session<Disconnected>, SocketAddr, Instant)> for Session<Connected> {
                 path,
                 last_recv: now,
                 last_sent: now,
+                pinger,
             },
         }
     }
@@ -451,6 +466,8 @@ impl Session<Connecting> {
                     return SessionMachine::Connected((self, from, now).into());
                 }
             }
+            // The peer may already be connected and pinging.
+            Message::Ping { id } => link.send(from, Message::Pong { id }, out),
             Message::Close { .. } => return SessionMachine::Closed(self.into()),
             _ => {}
         }
@@ -496,6 +513,8 @@ impl Session<Connected> {
                     s.last_recv = now;
                 }
             }
+            Message::Ping { id } => s.link.send(from, Message::Pong { id }, out),
+            Message::Pong { id } if from == s.path => s.pinger.pong(id, now),
             Message::Data(data) if from == s.path => out.push(Action::Data(data)),
             Message::Close { .. } => return SessionMachine::Closed(self.into()),
             _ => {}
@@ -507,6 +526,13 @@ impl Session<Connected> {
         let s = &mut self.state;
         if now - s.last_recv >= self.cfg.disconnect_timeout {
             return SessionMachine::Disconnected((self, now).into());
+        }
+        if let Some(interval) = self.cfg.ping_interval
+            && s.pinger.due(now)
+        {
+            let id = s.pinger.sent(now, interval);
+            s.link.send(s.path, Message::Ping { id }, out);
+            s.last_sent = now;
         }
         if now - s.last_sent >= self.cfg.keepalive_interval {
             let txid = s.link.check(s.path, false, out);
@@ -538,6 +564,7 @@ impl Session<Disconnected> {
             link,
             checker,
             path,
+            pinger,
             ..
         } = &mut self.state;
         if !link.open(raw, &packet) {
@@ -560,6 +587,8 @@ impl Session<Disconnected> {
                     new_path = Some(from);
                 }
             }
+            Message::Ping { id } => link.send(from, Message::Pong { id }, out),
+            Message::Pong { id } if from == old_path => pinger.pong(id, now),
             Message::Data(data) if from == old_path => out.push(Action::Data(data)),
             Message::Close { .. } => return SessionMachine::Closed(self.into()),
             _ => {}
@@ -615,6 +644,27 @@ impl SessionMachine {
             Self::Failed(s) => State::Failed(s.state.reason),
             Self::Closed(_) => State::Closed,
         }
+    }
+
+    /// Path quality, for sessions that have reached `Connecting`.
+    pub fn stats(&self, now: Instant) -> Option<SessionStats> {
+        let state = self.state();
+        let (cfg, pinger, checker, path) = match self {
+            Self::Connecting(_) => {
+                return Some(SessionStats {
+                    state,
+                    path: None,
+                    rtt: None,
+                    jitter: None,
+                    loss: 0.0,
+                });
+            }
+            Self::Connected(s) => (&s.cfg, &s.state.pinger, &s.state.checker, s.state.path),
+            Self::Disconnected(s) => (&s.cfg, &s.state.pinger, &s.state.checker, s.state.path),
+            _ => return None,
+        };
+        let kind = checker.pair(path).map(|p| p.remote.kind);
+        Some(pinger.stats(state, kind, now, cfg.check_timeout))
     }
 
     pub fn is_terminal(&self) -> bool {

@@ -15,20 +15,27 @@ import (
 
 func startServer(t *testing.T, cfg Config) netip.AddrPort {
 	t.Helper()
+	_, addr := startServerWith(t, cfg)
+	return addr
+}
+
+func startServerWith(t *testing.T, cfg Config) (*Server, netip.AddrPort) {
+	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- New(conn, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))).Serve(ctx) }()
+	srv := New(conn, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	go func() { done <- srv.Serve(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return conn.LocalAddr().(*net.UDPAddr).AddrPort()
+	return srv, conn.LocalAddr().(*net.UDPAddr).AddrPort()
 }
 
 // testClient is a minimal protocol client for driving the server.
@@ -250,5 +257,42 @@ func TestRateLimit(t *testing.T) {
 		if want := i < 2; ok != want {
 			t.Errorf("registration %d answered = %v, want %v", i, ok, want)
 		}
+	}
+}
+
+func TestStatsReachSnapshot(t *testing.T) {
+	srv, addr := startServerWith(t, DefaultConfig())
+	host, joiner, other := newClient(t, addr), newClient(t, addr), newClient(t, addr)
+	lobby := host.register(true).Lobby
+	joiner.register(false)
+	other.register(true)
+
+	joiner.send(&protocol.Join{Lobby: lobby})
+	sid := joiner.recv().(*protocol.PeerInfo).SessionID
+	host.recv()
+
+	if s := srv.Snapshot().Lobbies; len(s) != 2 || s[0].Sessions[0].State != "" {
+		t.Fatalf("before report: %+v", s)
+	}
+
+	// The other host cannot report on sessions outside its lobby.
+	other.send(&protocol.Stats{Sessions: []protocol.SessionStats{{SessionID: sid, State: protocol.StateDisconnected}}})
+	host.send(&protocol.Stats{Sessions: []protocol.SessionStats{{
+		SessionID: sid, State: protocol.StateConnected, PathKind: protocol.KindHost,
+		RTTMicros: 12500, RTTVarMicros: protocol.RTTUnknown, LossPermille: 15,
+	}}})
+
+	var got SessionSnapshot
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if got = srv.Snapshot().Lobbies[0].Sessions[0]; got.State != "" {
+			break
+		}
+	}
+	if got.State != "connected" || got.Path != "host" || got.RTTMs == nil || *got.RTTMs != 12.5 ||
+		got.JitterMs != nil || got.LossPercent == nil || *got.LossPercent != 1.5 {
+		t.Errorf("snapshot session: %+v", got)
+	}
+	if m, ok := host.tryRecv(100 * time.Millisecond); ok {
+		t.Errorf("STATS was answered with %T", m)
 	}
 }

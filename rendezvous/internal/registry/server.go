@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"time"
 
 	"knockknock/rendezvous/internal/auth"
@@ -51,13 +52,17 @@ type lobby struct {
 	id       protocol.LobbyID
 	host     *client
 	sessions map[uint64]*session
+	created  time.Time
 }
 
 type session struct {
-	id     uint64
-	key    auth.Key
-	lobby  *lobby
-	joiner *client
+	id      uint64
+	key     auth.Key
+	lobby   *lobby
+	joiner  *client
+	created time.Time
+	stats   protocol.SessionStats // latest report from the host
+	statsAt time.Time             // zero until the host reports
 }
 
 // pendingKey identifies a first-time registration so retries are idempotent.
@@ -66,15 +71,17 @@ type pendingKey struct {
 	nonce uint64
 }
 
-// Server handles all packets on a single goroutine, so its state needs no
-// locking.
+// Server handles all packets on a single goroutine. mu guards its state
+// against concurrent Snapshot calls.
 type Server struct {
 	conn    *net.UDPConn
 	cfg     Config
 	log     *slog.Logger
 	limiter *ratelimit.Limiter
 	now     func() time.Time
+	started time.Time
 
+	mu       sync.Mutex
 	clients  map[uint64]*client
 	pending  map[pendingKey]*client
 	lobbies  map[protocol.LobbyID]*lobby
@@ -88,6 +95,7 @@ func New(conn *net.UDPConn, cfg Config, log *slog.Logger) *Server {
 		log:      log,
 		limiter:  ratelimit.New(cfg.Rate, cfg.Burst),
 		now:      time.Now,
+		started:  time.Now(),
 		clients:  make(map[uint64]*client),
 		pending:  make(map[pendingKey]*client),
 		lobbies:  make(map[protocol.LobbyID]*lobby),
@@ -126,6 +134,9 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) handle(b []byte, from netip.AddrPort) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	pkt, err := protocol.Decode(b)
 	if err != nil {
 		s.log.Debug("dropping packet", "from", from, "err", err)
@@ -147,6 +158,8 @@ func (s *Server) handle(b []byte, from netip.AddrPort) {
 		s.sendRegistered(c, m.Nonce)
 	case *protocol.Join:
 		s.join(c, m, pkt.Seq, from)
+	case *protocol.Stats:
+		s.recordStats(c, m)
 	case *protocol.Close:
 		s.log.Info("client left", "client", c.id)
 		s.removeClient(c)
@@ -177,7 +190,7 @@ func (s *Server) registerNew(m *protocol.Register, from netip.AddrPort) {
 	s.clients[c.id] = c
 	s.pending[key] = c
 	if m.Host {
-		l := &lobby{id: s.newLobbyID(), host: c, sessions: make(map[uint64]*session)}
+		l := &lobby{id: s.newLobbyID(), host: c, sessions: make(map[uint64]*session), created: s.now()}
 		s.lobbies[l.id] = l
 		c.lobby = l
 	}
@@ -235,16 +248,31 @@ func (s *Server) join(c *client, m *protocol.Join, seq uint32, from netip.AddrPo
 	}
 
 	sess := &session{
-		id:     s.newID(func(id uint64) bool { return s.sessions[id] != nil }),
-		key:    auth.NewKey(),
-		lobby:  l,
-		joiner: c,
+		id:      s.newID(func(id uint64) bool { return s.sessions[id] != nil }),
+		key:     auth.NewKey(),
+		lobby:   l,
+		joiner:  c,
+		created: s.now(),
 	}
 	s.sessions[sess.id] = sess
 	l.sessions[sess.id] = sess
 	c.session = sess
 	s.log.Info("joined", "lobby", l.id, "client", c.id, "session", sess.id)
 	s.introduce(sess)
+}
+
+// recordStats stores a host's report. Entries for sessions outside the
+// host's own lobby are ignored. STATS is never answered.
+func (s *Server) recordStats(c *client, m *protocol.Stats) {
+	if c.lobby == nil {
+		return
+	}
+	now := s.now()
+	for _, st := range m.Sessions {
+		if sess, ok := c.lobby.sessions[st.SessionID]; ok {
+			sess.stats, sess.statsAt = st, now
+		}
+	}
 }
 
 // introduce sends each side of a session the other's candidates.
@@ -290,6 +318,8 @@ func (s *Server) write(b []byte, to netip.AddrPort) {
 }
 
 func (s *Server) reap(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, c := range s.clients {
 		if now.Sub(c.seen) > s.cfg.TTL {
 			s.log.Info("expired", "client", c.id)

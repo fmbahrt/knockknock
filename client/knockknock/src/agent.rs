@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{self, Dir, Key, ReplayWindow};
 use crate::candidate::Candidate;
-use crate::protocol::{self, ErrorCode, LobbyId, Message, Packet, Role};
+use crate::protocol::{
+    self, ErrorCode, LobbyId, MAX_STATS, Message, Packet, ReportedState, Role, StatsEntry,
+};
 use crate::session::{Action, Link, SessionMachine, State};
+use crate::stats::SessionStats;
 use crate::{Config, Error};
 
 pub type SessionId = u64;
@@ -80,6 +83,7 @@ pub struct Agent {
     /// The joiner's session before the server has introduced us.
     pending: Option<SessionMachine>,
     next_join: Instant,
+    next_stats: Instant,
     last_tick: Instant,
     out: VecDeque<Output>,
 }
@@ -110,6 +114,7 @@ impl Agent {
             sessions: HashMap::new(),
             pending,
             next_join: now,
+            next_stats: now + cfg.stats_interval,
             last_tick: now,
             out: VecDeque::new(),
         }
@@ -121,6 +126,11 @@ impl Agent {
 
     pub fn session_state(&self, id: SessionId) -> Option<State> {
         self.sessions.get(&id).map(SessionMachine::state)
+    }
+
+    /// Path quality for a session: RTT, jitter and loss from its pings.
+    pub fn stats(&self, id: SessionId, now: Instant) -> Option<SessionStats> {
+        self.sessions.get(&id)?.stats(now)
     }
 
     pub fn poll_output(&mut self) -> Option<Output> {
@@ -135,9 +145,10 @@ impl Agent {
             Registration::Closed => None,
         };
         let join = self.wants_join().then_some(self.next_join);
+        let stats = self.wants_stats().then_some(self.next_stats);
         let active = self.pending.is_some() || self.sessions.values().any(|s| !s.is_terminal());
         let tick = active.then(|| self.last_tick + self.cfg.tick_interval);
-        [reg, join, tick].into_iter().flatten().min()
+        [reg, join, stats, tick].into_iter().flatten().min()
     }
 
     pub fn handle_packet(&mut self, from: SocketAddr, raw: &[u8], now: Instant) {
@@ -189,6 +200,11 @@ impl Agent {
         let ids: Vec<_> = self.sessions.keys().copied().collect();
         for id in ids {
             self.step(id, |s, out| s.tick(now, out));
+        }
+
+        if self.wants_stats() && now >= self.next_stats {
+            self.next_stats = now + self.cfg.stats_interval;
+            self.report_stats(now);
         }
     }
 
@@ -381,6 +397,43 @@ impl Agent {
                     .sessions
                     .values()
                     .any(|s| s.state() == State::Connecting && !s.heard_from_peer()))
+    }
+
+    /// Hosts report their sessions' path quality to the server.
+    fn wants_stats(&self) -> bool {
+        self.mode == Mode::Host
+            && matches!(self.reg, Registration::Active { .. })
+            && !self.sessions.is_empty()
+    }
+
+    fn report_stats(&mut self, now: Instant) {
+        let Registration::Active { secret, .. } = self.reg else {
+            return;
+        };
+        let micros = |d: Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX - 1);
+        let entries: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(&session_id, s)| {
+                let st = s.stats(now)?;
+                let state = match st.state {
+                    State::Connecting => ReportedState::Connecting,
+                    State::Connected { .. } => ReportedState::Connected,
+                    State::Disconnected => ReportedState::Disconnected,
+                    _ => return None,
+                };
+                Some(StatsEntry {
+                    session_id,
+                    state,
+                    path: st.path,
+                    rtt_us: st.rtt.map(micros),
+                    rttvar_us: st.jitter.map(micros),
+                    loss_permille: (st.loss * 1000.0).round() as u16,
+                })
+            })
+            .take(MAX_STATS)
+            .collect();
+        self.send_server(Message::Stats(entries), Some(&secret));
     }
 
     fn register_msg(&self, nonce: u64) -> Message {
@@ -578,6 +631,57 @@ mod tests {
         // A duplicate PEER_INFO (retried JOIN) is ignored.
         agent.handle_packet(server(), &peer_info, now);
         assert_eq!(drain(&mut agent), (vec![], vec![]));
+    }
+
+    #[test]
+    fn host_reports_stats() {
+        let now = Instant::now();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Host, now);
+        let mut srv = FakeServer { seq: 0 };
+        register(&mut agent, &mut srv, None, now);
+
+        // Nothing to report without sessions.
+        let later = now + Config::default().stats_interval;
+        agent.handle_timeout(later);
+        assert!(
+            !drain(&mut agent)
+                .0
+                .iter()
+                .any(|p| matches!(p.msg, Message::Stats(_)))
+        );
+
+        let peer_info = srv.reply(Message::PeerInfo {
+            session_id: 5,
+            role: Role::Controlling,
+            key: [1; 16],
+            candidates: vec![Candidate::host("198.51.100.7:6000".parse().unwrap())],
+        });
+        agent.handle_packet(server(), &peer_info, later);
+        drain(&mut agent);
+
+        // The report is already due; go well before the session's checks time out.
+        let report_at = later + Duration::from_secs(1);
+        agent.handle_timeout(report_at);
+        let (sent, _) = drain(&mut agent);
+        let stats = sent.iter().find_map(|p| match &p.msg {
+            Message::Stats(e) => Some(e.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            stats,
+            Some(vec![StatsEntry {
+                session_id: 5,
+                state: ReportedState::Connecting,
+                path: None,
+                rtt_us: None,
+                rttvar_us: None,
+                loss_permille: 0,
+            }])
+        );
+        assert_eq!(
+            agent.stats(5, report_at).map(|s| s.state),
+            Some(State::Connecting)
+        );
     }
 
     #[test]

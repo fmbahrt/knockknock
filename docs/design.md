@@ -161,7 +161,7 @@ path.
 
 **Threat model: off-path attackers.** Credentials travel in plaintext UDP,
 so an attacker who can read the first packets of a session can learn them. The
-upgrade path is to move signalling to TLS (§13). Game data that needs
+upgrade path is to move signalling to TLS (§14). Game data that needs
 confidentiality should use authenticated encryption on top.
 
 - `client_secret` (per client) and `session_key` (per session) are 128-bit
@@ -210,7 +210,31 @@ is authenticated but not encrypted. Duplicates are dropped by the replay
 window; reordering is left to the application. Reliable channels (needed for
 Godot RPCs) and the Godot `MultiplayerPeerExtension` are a later stage.
 
-## 11. Timers (all configurable)
+## 11. Path statistics and dashboard
+
+Once connected, each side sends `PING` on the selected path every
+`ping_interval` and matches `PONG`s by ID. It keeps:
+
+- **RTT**: smoothed the way TCP does (RFC 6298, gain 1/8), seeded with the RTT
+  of the nominated pair's checks so a value exists from the first moment.
+- **Jitter**: RFC 6298's `rttvar` (gain 1/4).
+- **Loss**: the share of the last 32 pings with no pong within `check_timeout`.
+- **Path kind**: host, server-reflexive or peer-reflexive, i.e. whether the
+  peers ended up on a LAN path, a punched NAT mapping, or a mapping learned
+  during checks.
+
+Pings count as traffic, so they also stand in for keepalives. The game can read
+the numbers through `Client::stats` / `Agent::stats`.
+
+Hosts send a `STATS` report for all their sessions to the rendezvous server
+every `stats_interval` (5 s). Only the lobby's host may report on its
+sessions, and the server never answers. The server serves a read-only
+**dashboard** (`-http`, default `127.0.0.1:8080`): a page listing every lobby
+with each joiner's state, path, RTT, jitter and loss, refreshed every 2 s from
+`/api/lobbies` (JSON). The dashboard shows lobby IDs, which are join
+capabilities (§8). Keep it on localhost or behind authentication.
+
+## 12. Timers (all configurable)
 
 | Parameter | Default |
 |---|---|
@@ -222,13 +246,15 @@ Godot RPCs) and the Godot `MultiplayerPeerExtension` are a later stage.
 | `keepalive_interval` (when idle) | 5 s |
 | `disconnect_timeout` | 15 s |
 | `recovery_timeout` | 10 s |
+| `ping_interval` | 1 s (`None` disables) |
+| `stats_interval` (host → server) | 5 s |
 | server retry | 500 ms |
 | registration TTL (server) | 60 s, refreshed every TTL/4 |
 
 NAT mapping lifetimes vary, often as low as 20–30 s for UDP. That is why these
 are settings, not constants.
 
-## 12. Known limitations
+## 13. Known limitations
 
 - **Symmetric NAT on both sides** (or symmetric against port-restricted) cannot
   be punched; the session fails with `NoPath`. Relay is the fix.
@@ -237,9 +263,9 @@ are settings, not constants.
   candidates. With multiple NAT levels, the server-reflexive path needs the
   outer NAT to hairpin (paper §3.5).
 - Single host candidate (primary interface) only.
-- No relay, no NAT probe, no signalling encryption yet (see §13).
+- No relay, no NAT probe, no signalling encryption yet (see §14).
 
-## 13. Planned: signalling over TCP/TLS
+## 14. Planned: signalling over TCP/TLS
 
 Today every client↔server message goes over UDP. Signalling (register,
 lobby, join, introductions) should move to a reliable, encrypted TCP
@@ -317,14 +343,15 @@ only the Rust client, since the server never sees game data. Session keys still
 come from the server, so the server operator could read game traffic; peer-only
 keys would need an X25519 exchange between peers, which is out of scope.
 
-## 14. Roadmap
+## 15. Roadmap
 
 1. ✅ Basic UDP + rendezvous (v1 scaffold)
 2. ✅ Lobbies, authenticated rendezvous (this version)
 3. ✅ Authenticated simultaneous checks, nomination
 4. ✅ Session and pair state machines
 5. ✅ Keepalive, failure detection, recovery
-6. Signalling over TCP/TLS with UDP `BIND` (§13)
-7. Relay through the rendezvous server
-8. Hardening: NAT probe, fuzzing, diagnostics, multi-interface
-9. Godot GDExtension + reliable channels
+6. ✅ Path statistics (PING/PONG), host reports, server dashboard
+7. Signalling over TCP/TLS with UDP `BIND` (§14)
+8. Relay through the rendezvous server
+9. Hardening: NAT probe, fuzzing, diagnostics, multi-interface
+10. Godot GDExtension + reliable channels

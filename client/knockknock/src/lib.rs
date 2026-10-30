@@ -17,6 +17,7 @@ pub mod protocol;
 mod session;
 #[cfg(test)]
 mod sim;
+mod stats;
 
 use std::time::Duration;
 use std::{fmt, io};
@@ -26,6 +27,7 @@ pub use client::Client;
 pub use pair::PairState;
 pub use protocol::{ErrorCode, LobbyId, ProtocolError};
 pub use session::{FailReason, State};
+pub use stats::SessionStats;
 
 /// Timers and limits. The defaults are starting points, not universal truths:
 /// NAT mapping lifetimes vary between networks.
@@ -47,6 +49,11 @@ pub struct Config {
     pub disconnect_timeout: Duration,
     /// How long recovery may take before the session fails.
     pub recovery_timeout: Duration,
+    /// How often a connected session pings its peer to measure RTT, jitter
+    /// and loss. `None` disables pinging (keepalives still run).
+    pub ping_interval: Option<Duration>,
+    /// How often a host reports its sessions' stats to the server.
+    pub stats_interval: Duration,
     /// Maximum number of pairs in `Checking` at once.
     pub max_concurrent_checks: usize,
     /// How often unanswered requests to the rendezvous server are resent.
@@ -66,6 +73,8 @@ impl Default for Config {
             keepalive_interval: Duration::from_secs(5),
             disconnect_timeout: Duration::from_secs(15),
             recovery_timeout: Duration::from_secs(10),
+            ping_interval: Some(Duration::from_secs(1)),
+            stats_interval: Duration::from_secs(5),
             max_concurrent_checks: 8,
             server_retry: Duration::from_millis(500),
             tick_interval: Duration::from_millis(50),

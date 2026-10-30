@@ -49,6 +49,12 @@ func vectors() []vector {
 		{"check_ack", Packet{session, 7, &CheckAck{TxID: 0x1122334455667788, Nominate: true,
 			Observed: netip.MustParseAddrPort("203.0.113.7:4242")}}, auth.JoinerToHost, true},
 		{"data", Packet{session, 8, &Data{Payload: []byte("hello")}}, auth.HostToJoiner, true},
+		{"stats", Packet{client, 9, &Stats{Sessions: []SessionStats{
+			{SessionID: session, State: StateConnected, PathKind: KindServerReflexive, RTTMicros: 23500, RTTVarMicros: 1200, LossPermille: 25},
+			{SessionID: 0x0102030405060708, State: StateConnecting, RTTMicros: RTTUnknown, RTTVarMicros: RTTUnknown},
+		}}}, auth.ClientToServer, true},
+		{"ping", Packet{session, 10, &Ping{ID: 0xdeadbeef}}, auth.HostToJoiner, true},
+		{"pong", Packet{session, 11, &Pong{ID: 0xdeadbeef}}, auth.JoinerToHost, true},
 	}
 }
 
@@ -146,6 +152,8 @@ func TestDecodeErrors(t *testing.T) {
 		{"bad lobby char", append(hdr(TypeJoin), 'K', '7', 'M', '2', 'Q', 'O'), ErrBadField},
 		{"bad role", append(hdr(TypePeerInfo), append(make([]byte, 8), 9)...), ErrBadField},
 		{"data too long", append(hdr(TypeData), make([]byte, MaxDataLen+1)...), ErrBadField},
+		{"stats bad state", append(hdr(TypeStats), append([]byte{1}, append(make([]byte, 8), 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)...)...), ErrBadField},
+		{"stats too many", append(hdr(TypeStats), MaxStats+1), ErrBadField},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

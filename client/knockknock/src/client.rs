@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::agent::{Agent, Event, Mode, Output, SessionId};
 use crate::candidate::gather_host;
 use crate::protocol::LobbyId;
-use crate::{Config, Error};
+use crate::{Config, Error, SessionStats};
 
 /// Drives an [`Agent`] over a `std::net::UdpSocket`.
 ///
@@ -93,6 +93,11 @@ impl Client {
     pub fn send(&mut self, session: SessionId, data: &[u8]) -> Result<(), Error> {
         self.agent.send(session, data, Instant::now())?;
         self.flush()
+    }
+
+    /// Path quality for a session: RTT, jitter and loss from its pings.
+    pub fn stats(&self, session: SessionId) -> Option<SessionStats> {
+        self.agent.stats(session, Instant::now())
     }
 
     /// Closes one session.
