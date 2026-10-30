@@ -2,3 +2,6 @@
 /client/target/
 .DS_Store
 dev-ca.pem
+/godot/.godot/
+/godot/addons/knockknock/bin/
+/godot/dev-ca.pem

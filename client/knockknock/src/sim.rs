@@ -141,6 +141,7 @@ struct Sim {
     duplicate: f64,
     jitter: Duration,
     blackout: bool,
+    host_deaf: bool,
     received: [Vec<Vec<u8>>; 2],
     next_tick: Instant,
 }
@@ -148,6 +149,20 @@ struct Sim {
 impl Sim {
     /// `nodes` are (local address, index into `nats` or None for public).
     fn new(cfg: Config, nats: Vec<Nat>, nodes: [(&str, Option<usize>); 2]) -> Self {
+        Self::build(cfg, nats, nodes, false)
+    }
+
+    /// The host is send-only: like an ENet-owned port, it receives nothing.
+    fn send_only_host(cfg: Config, nats: Vec<Nat>, nodes: [(&str, Option<usize>); 2]) -> Self {
+        Self::build(cfg, nats, nodes, true)
+    }
+
+    fn build(
+        cfg: Config,
+        nats: Vec<Nat>,
+        nodes: [(&str, Option<usize>); 2],
+        send_only: bool,
+    ) -> Self {
         let start = Instant::now();
         let mut sim = Self {
             cfg,
@@ -162,6 +177,7 @@ impl Sim {
             duplicate: 0.0,
             jitter: Duration::ZERO,
             blackout: false,
+            host_deaf: send_only,
             received: [Vec::new(), Vec::new()],
             next_tick: start,
         };
@@ -187,8 +203,12 @@ impl Sim {
 
         for (i, role) in [(HOST, Role::Controlling), (JOINER, Role::Controlled)] {
             let mut out = Vec::new();
+            let mut link = Link::new(SESSION, role, KEY);
+            if send_only && i == HOST {
+                link = link.send_only();
+            }
             let s = SessionMachine::new(cfg).start().peer_info(
-                Link::new(SESSION, role, KEY),
+                link,
                 candidates[1 - i].clone(),
                 start,
                 &mut out,
@@ -230,6 +250,9 @@ impl Sim {
         let (due, later): (Vec<_>, Vec<_>) = self.flight.drain(..).partition(|p| p.at <= now);
         self.flight = later;
         for p in due {
+            if self.host_deaf && p.to == HOST {
+                continue;
+            }
             let Ok(packet) = Packet::decode(&p.bytes) else {
                 continue;
             };
@@ -272,6 +295,22 @@ impl Sim {
             .send_data(data, now, &mut out)
             .unwrap();
         self.apply(i, out);
+    }
+
+    /// The address node `from` appears to come from when sending to `to`, as
+    /// the game transport on the other side would see it.
+    fn seen_from(&mut self, from: usize, to: SocketAddr) -> SocketAddr {
+        let src = self.nodes[from].addr;
+        match self.nodes[from].nat {
+            Some(n) if self.nodes[1 - from].nat != Some(n) => self.nats[n].outbound(src, to),
+            _ => src,
+        }
+    }
+
+    /// Send-only host: the game transport reports the joiner connected.
+    fn confirm(&mut self, addr: SocketAddr) {
+        let s = self.sessions[HOST].take().unwrap();
+        self.sessions[HOST] = Some(s.confirm(addr, self.now));
     }
 
     fn close(&mut self, i: usize) {
@@ -610,4 +649,83 @@ fn rejects_forged_reflected_and_replayed_checks() {
     let valid = check(&KEY, Dir::JoinerToHost, 5);
     assert_eq!(deliver(valid.clone()), 1, "valid check is acked");
     assert_eq!(deliver(valid), 0, "replay answered");
+}
+
+// ---- Send-only host (ENet hand-off, docs/design.md §15) -----------------------
+
+#[test]
+fn send_only_host_punches_for_joiner() {
+    let mut sim = Sim::send_only_host(
+        Config::default(),
+        vec![
+            Nat::port_restricted("203.0.113.1"),
+            Nat::port_restricted("203.0.113.2"),
+        ],
+        [("10.0.0.2:5000", Some(0)), ("10.1.0.2:6000", Some(1))],
+    );
+    assert!(sim.run_until(Duration::from_secs(3), |s| connected(s.state(JOINER))));
+    // The joiner connects to the host's public mapping, verified by the
+    // host's authenticated checks, without the host hearing anything.
+    let host_addr = path(&sim, JOINER);
+    assert_eq!(host_addr.ip(), "203.0.113.1".parse::<IpAddr>().unwrap());
+    assert_eq!(sim.state(HOST), State::Connecting);
+
+    // ENet on the host sees the joiner connect from its NAT mapping.
+    let joiner_seen = sim.seen_from(JOINER, host_addr);
+    sim.confirm(joiner_seen);
+    assert_eq!(path(&sim, HOST), joiner_seen);
+
+    // Once confirmed, the host goes quiet and never times out on its own.
+    let cfg = Config::default();
+    assert!(
+        !sim.run_until(cfg.disconnect_timeout + cfg.recovery_timeout, |s| {
+            !connected(s.state(HOST))
+        })
+    );
+}
+
+#[test]
+fn send_only_host_on_same_lan() {
+    let mut sim = Sim::send_only_host(
+        Config::default(),
+        vec![Nat::port_restricted("203.0.113.1")],
+        [("10.0.0.2:5000", Some(0)), ("10.0.0.3:6000", Some(0))],
+    );
+    assert!(sim.run_until(Duration::from_secs(3), |s| connected(s.state(JOINER))));
+    assert_eq!(path(&sim, JOINER), addr("10.0.0.2:5000"));
+}
+
+#[test]
+fn send_only_host_cannot_reach_symmetric_joiner() {
+    // The host can only aim at the joiner's server-reflexive mapping, which a
+    // symmetric NAT does not reuse for other destinations; and the host never
+    // hears the joiner's checks, so it cannot learn a peer-reflexive one.
+    let mut sim = Sim::send_only_host(
+        Config::default(),
+        vec![
+            Nat::port_restricted("203.0.113.1"),
+            Nat::symmetric("203.0.113.2"),
+        ],
+        [("10.0.0.2:5000", Some(0)), ("10.1.0.2:6000", Some(1))],
+    );
+    let limit = Config::default().connect_timeout + Duration::from_millis(500);
+    let failed = |s: State| s == State::Failed(FailReason::NoPath);
+    assert!(
+        sim.run_until(limit, |s| s.both(failed)),
+        "host {:?}, joiner {:?}",
+        sim.state(HOST),
+        sim.state(JOINER)
+    );
+}
+
+#[test]
+fn join_token_matches_on_both_sides() {
+    let host = Link::new(SESSION, Role::Controlling, KEY).send_only();
+    let joiner = Link::new(SESSION, Role::Controlled, KEY);
+    assert_eq!(host.join_token(), joiner.join_token());
+    assert_eq!(host.join_token().len(), 32);
+    assert_ne!(
+        Link::new(SESSION, Role::Controlled, [8; 16]).join_token(),
+        joiner.join_token()
+    );
 }

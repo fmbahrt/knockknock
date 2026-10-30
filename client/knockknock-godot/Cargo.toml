@@ -1,0 +1,17 @@
+[package]
+name = "knockknock-godot"
+description = "Godot 4.7 GDExtension for knockknock lobby NAT punching with ENet hand-off"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+knockknock = { path = "../knockknock" }
+godot = { version = "0.5.5", features = ["api-4-7"] }
+
+[lints]
+workspace = true

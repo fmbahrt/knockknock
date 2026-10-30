@@ -26,7 +26,7 @@ func main() {
 	addr := flag.String("addr", ":7777", "address to listen on (TCP for TLS signalling, UDP for BIND)")
 	certFile := flag.String("tls-cert", "", "TLS certificate chain (PEM); without it a development CA is generated")
 	keyFile := flag.String("tls-key", "", "TLS private key (PEM)")
-	devCA := flag.String("tls-dev-ca", "dev-ca.pem", "where to write the generated development CA, for clients to trust")
+	devCA := flag.String("tls-dev-ca", "dev-ca.pem", "development CA certificate for clients to trust; its key is kept at <path>.key and reused across restarts")
 	devHosts := flag.String("tls-dev-hosts", "localhost,127.0.0.1,::1", "comma-separated names and IPs the development certificate is valid for")
 	flag.IntVar(&cfg.MaxLobby, "max-lobby", cfg.MaxLobby, "maximum peers per lobby, host included")
 	flag.Float64Var(&cfg.Rate, "rate", cfg.Rate, "sustained new connections/joins per second per IP")
@@ -89,14 +89,16 @@ func loadOrGenerate(certFile, keyFile, devCA, devHosts string, log *slog.Logger)
 	if certFile != "" || keyFile != "" {
 		return tls.LoadX509KeyPair(certFile, keyFile)
 	}
-	cert, caPEM, err := devcert.Generate(strings.Split(devHosts, ","))
+	cert, created, err := devcert.LoadOrCreate(devCA, strings.Split(devHosts, ","))
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	if err := os.WriteFile(devCA, caPEM, 0o644); err != nil {
-		return tls.Certificate{}, err
+	if created {
+		log.Warn("created a development CA; clients must trust this file (pass -tls-cert/-tls-key in production)",
+			"ca", devCA, "hosts", devHosts)
+	} else {
+		log.Warn("using the existing development CA (pass -tls-cert/-tls-key in production)",
+			"ca", devCA, "hosts", devHosts)
 	}
-	log.Warn("using a generated development certificate; pass -tls-cert/-tls-key in production",
-		"ca", devCA, "hosts", devHosts)
 	return cert, nil
 }

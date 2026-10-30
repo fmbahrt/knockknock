@@ -53,40 +53,20 @@ impl ServerTrust {
     }
 }
 
-/// Drives an [`Agent`] over a TLS signalling connection and a
-/// `std::net::UdpSocket`.
-///
-/// The UDP socket carries BINDs, connectivity checks and game data: the
-/// punched NAT mappings belong to it.
-pub struct Client {
-    socket: UdpSocket,
+/// The TLS signalling connection to the rendezvous server, over a
+/// non-blocking `TcpStream`. It moves bytes between the socket and an
+/// [`Agent`]; drivers call [`SignalConn::pump`] regularly.
+pub struct SignalConn {
     tcp: TcpStream,
     tls: ClientConnection,
-    signal_open: bool,
-    agent: Agent,
-    events: VecDeque<Event>,
+    open: bool,
 }
 
-impl Client {
-    /// Opens a lobby on the rendezvous server at `server` (`host:port`). The
-    /// lobby ID arrives as [`Event::Registered`].
-    pub fn host(server: &str, trust: ServerTrust) -> Result<Self, Error> {
-        Self::connect(server, Mode::Host, trust, Config::default())
-    }
-
-    /// Joins the lobby `lobby` on the rendezvous server at `server`.
-    pub fn join(server: &str, lobby: LobbyId, trust: ServerTrust) -> Result<Self, Error> {
-        Self::connect(server, Mode::Join(lobby), trust, Config::default())
-    }
-
+impl SignalConn {
     /// Connects to `server` (`host:port`; the host part is also the name its
-    /// certificate is checked against).
-    pub fn connect(
-        server: &str,
-        mode: Mode,
-        trust: ServerTrust,
-        cfg: Config,
-    ) -> Result<Self, Error> {
+    /// certificate is checked against). Returns the connection and the
+    /// server's address, which is also where BINDs go over UDP.
+    pub fn connect(server: &str, trust: &ServerTrust) -> Result<(Self, SocketAddr), Error> {
         let invalid =
             |msg: &str| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, msg.to_owned()));
         let (host, _) = server
@@ -110,24 +90,180 @@ impl Client {
                 .with_root_certificates(trust.roots()?)
                 .with_no_client_auth();
         let tls = ClientConnection::new(Arc::new(config), name)?;
-        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        let tcp =
+            TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| match e.kind() {
+                io::ErrorKind::ConnectionRefused => io::Error::new(
+                    e.kind(),
+                    format!("nothing is listening at {addr}; is the rendezvous server running?"),
+                ),
+                io::ErrorKind::TimedOut => io::Error::new(
+                    e.kind(),
+                    format!("no answer from {addr} (firewall, or wrong address?)"),
+                ),
+                _ => e,
+            })?;
         tcp.set_nodelay(true)?;
         tcp.set_nonblocking(true)?;
+        Ok((
+            Self {
+                tcp,
+                tls,
+                open: true,
+            },
+            addr,
+        ))
+    }
 
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Queues signalling bytes from [`Output::Signal`]. rustls buffers them
+    /// (also during the handshake) until [`SignalConn::pump`] writes them.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.open {
+            self.tls.writer().write_all(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Reads whatever has arrived into `agent`, then writes what is queued.
+    /// TLS failures (e.g. an untrusted certificate) are returned; a closed
+    /// connection is reported to the agent, which emits `ServerLost`.
+    pub fn pump(&mut self, agent: &mut Agent) -> Result<(), Error> {
+        self.read(agent)?;
+        self.flush(agent);
+        if self.open && !agent.signal_open() {
+            // The agent is done with signalling (a corrupt stream).
+            self.drop_conn(agent);
+        }
+        Ok(())
+    }
+
+    /// Sends what is queued plus a TLS close_notify, blocking briefly.
+    pub fn close(mut self) -> Result<(), Error> {
+        if self.open {
+            self.tls.send_close_notify();
+            self.tcp.set_nonblocking(false)?;
+            self.tcp.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+            while self.tls.wants_write() {
+                self.tls.write_tls(&mut self.tcp)?;
+            }
+            let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, agent: &mut Agent) -> Result<(), Error> {
+        if !self.open {
+            return Ok(());
+        }
+        loop {
+            match self.tls.read_tls(&mut self.tcp) {
+                Ok(0) => {
+                    self.drop_conn(agent);
+                    return Ok(());
+                }
+                Ok(_) => {
+                    let state = match self.tls.process_new_packets() {
+                        Ok(state) => state,
+                        Err(e) => {
+                            // Send the alert, then report (e.g. a bad certificate).
+                            self.flush(agent);
+                            self.drop_conn(agent);
+                            return Err(e.into());
+                        }
+                    };
+                    let n = state.plaintext_bytes_to_read();
+                    let closed = state.peer_has_closed();
+                    if n > 0 {
+                        let mut buf = vec![0; n];
+                        self.tls.reader().read_exact(&mut buf)?;
+                        agent.handle_signal(&buf, Instant::now());
+                    }
+                    if closed {
+                        self.drop_conn(agent);
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    self.drop_conn(agent);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self, agent: &mut Agent) {
+        while self.open && self.tls.wants_write() {
+            match self.tls.write_tls(&mut self.tcp) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => self.drop_conn(agent),
+            }
+        }
+    }
+
+    fn drop_conn(&mut self, agent: &mut Agent) {
+        if self.open {
+            self.open = false;
+            let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+            agent.signal_closed();
+        }
+    }
+}
+
+/// Drives an [`Agent`] over a TLS signalling connection and a
+/// `std::net::UdpSocket`.
+///
+/// The UDP socket carries BINDs, connectivity checks and game data: the
+/// punched NAT mappings belong to it. [`Client::hand_off`] releases it to
+/// another transport once connected.
+pub struct Client {
+    socket: Option<UdpSocket>,
+    local_port: u16,
+    signal: SignalConn,
+    agent: Agent,
+    events: VecDeque<Event>,
+}
+
+impl Client {
+    /// Opens a lobby on the rendezvous server at `server` (`host:port`). The
+    /// lobby ID arrives as [`Event::Registered`].
+    pub fn host(server: &str, trust: ServerTrust) -> Result<Self, Error> {
+        Self::connect(server, Mode::Host, trust, Config::default())
+    }
+
+    /// Joins the lobby `lobby` on the rendezvous server at `server`.
+    pub fn join(server: &str, lobby: LobbyId, trust: ServerTrust) -> Result<Self, Error> {
+        Self::connect(server, Mode::Join(lobby), trust, Config::default())
+    }
+
+    /// Connects to `server` (`host:port`). [`Mode::HostSendOnly`] is for
+    /// drivers that send through another transport and is not supported here.
+    pub fn connect(
+        server: &str,
+        mode: Mode,
+        trust: ServerTrust,
+        cfg: Config,
+    ) -> Result<Self, Error> {
+        let (signal, addr) = SignalConn::connect(server, &trust)?;
         let any: SocketAddr = if addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         };
         let socket = UdpSocket::bind(any)?;
-        let candidates = gather_host(socket.local_addr()?, addr)?;
+        let local = socket.local_addr()?;
+        let candidates = gather_host(local, addr)?;
         let agent = Agent::new(cfg, addr, candidates, mode, Instant::now());
 
         let mut client = Self {
-            socket,
-            tcp,
-            tls,
-            signal_open: true,
+            socket: Some(socket),
+            local_port: local.port(),
+            signal,
             agent,
             events: VecDeque::new(),
         };
@@ -135,19 +271,26 @@ impl Client {
         Ok(client)
     }
 
-    /// The local address of the game socket. A Godot-style hand-off binds
-    /// the next socket (e.g. ENet) to this port.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+    /// The local port of the game socket. A hand-off binds the next
+    /// transport (e.g. ENet) to this port.
+    pub fn local_port(&self) -> u16 {
+        self.local_port
     }
 
     /// Processes whatever is ready without blocking and returns the next
     /// event, if any. Call it every frame from a game loop.
     pub fn poll(&mut self) -> Result<Option<Event>, Error> {
-        self.socket.set_nonblocking(true)?;
-        let result = self.poll_inner();
-        self.socket.set_nonblocking(false)?;
-        result
+        let mut buf = [0u8; 1500];
+        if let Some(socket) = &self.socket {
+            socket.set_nonblocking(true)?;
+        }
+        while self.recv_one(&mut buf)? {}
+        let now = Instant::now();
+        if self.agent.poll_timeout().is_some_and(|t| t <= now) {
+            self.agent.handle_timeout(now);
+        }
+        self.service()?;
+        Ok(self.events.pop_front())
     }
 
     /// Blocks until an event arrives or `timeout` passes (`None` waits
@@ -168,7 +311,7 @@ impl Client {
                 self.agent.handle_timeout(now);
                 continue;
             }
-            let signal = self.signal_open.then(|| now + SIGNAL_POLL);
+            let signal = self.signal.is_open().then(|| now + SIGNAL_POLL);
             let wake = [self.agent.poll_timeout(), deadline, signal]
                 .into_iter()
                 .flatten()
@@ -177,8 +320,14 @@ impl Client {
                 w.saturating_duration_since(now)
                     .max(Duration::from_millis(1))
             });
-            self.socket.set_read_timeout(wait)?;
-            self.recv_one(&mut buf)?;
+            match &self.socket {
+                Some(socket) => {
+                    socket.set_nonblocking(false)?;
+                    socket.set_read_timeout(wait)?;
+                    self.recv_one(&mut buf)?;
+                }
+                None => std::thread::sleep(wait.unwrap_or(SIGNAL_POLL)),
+            }
         }
     }
 
@@ -193,6 +342,17 @@ impl Client {
         self.agent.stats(session, Instant::now())
     }
 
+    /// Joiner: releases the game socket once connected so another transport
+    /// (ENet) can bind [`Client::local_port`]. Signalling stays up, keeping
+    /// the joiner's seat in the lobby; keep calling `poll`/`wait`. Returns
+    /// the session and the host address to connect to.
+    pub fn hand_off(&mut self) -> Option<(SessionId, SocketAddr)> {
+        let handed = self.agent.hand_off()?;
+        let _ = self.drain_outputs();
+        self.socket = None;
+        Some(handed)
+    }
+
     /// Closes one session.
     pub fn close_session(&mut self, session: SessionId) -> Result<(), Error> {
         self.agent.close_session(session);
@@ -204,104 +364,23 @@ impl Client {
     pub fn close(mut self) -> Result<(), Error> {
         self.agent.close();
         self.drain_outputs()?;
-        if self.signal_open {
-            self.tls.send_close_notify();
-            self.tcp.set_nonblocking(false)?;
-            while self.tls.wants_write() {
-                self.tls.write_tls(&mut self.tcp)?;
-            }
-            let _ = self.tcp.shutdown(std::net::Shutdown::Both);
-        }
-        Ok(())
-    }
-
-    fn poll_inner(&mut self) -> Result<Option<Event>, Error> {
-        let mut buf = [0u8; 1500];
-        while self.recv_one(&mut buf)? {}
-        let now = Instant::now();
-        if self.agent.poll_timeout().is_some_and(|t| t <= now) {
-            self.agent.handle_timeout(now);
-        }
-        self.service()?;
-        Ok(self.events.pop_front())
+        self.signal.close()
     }
 
     /// Moves bytes between the agent and the TLS connection, and sends
     /// queued datagrams.
     fn service(&mut self) -> Result<(), Error> {
-        self.read_signal()?;
+        self.signal.pump(&mut self.agent)?;
         self.drain_outputs()?;
-        self.write_signal();
-        if self.signal_open && !self.agent.signal_open() {
-            // The agent is done with signalling (a corrupt stream).
-            self.drop_signal();
-        }
-        Ok(())
-    }
-
-    fn read_signal(&mut self) -> Result<(), Error> {
-        if !self.signal_open {
-            return Ok(());
-        }
-        loop {
-            match self.tls.read_tls(&mut self.tcp) {
-                Ok(0) => {
-                    self.drop_signal();
-                    return Ok(());
-                }
-                Ok(_) => {
-                    let state = match self.tls.process_new_packets() {
-                        Ok(state) => state,
-                        Err(e) => {
-                            // Send the alert, then report (e.g. a bad certificate).
-                            self.write_signal();
-                            self.drop_signal();
-                            return Err(e.into());
-                        }
-                    };
-                    let n = state.plaintext_bytes_to_read();
-                    let closed = state.peer_has_closed();
-                    if n > 0 {
-                        let mut buf = vec![0; n];
-                        self.tls.reader().read_exact(&mut buf)?;
-                        self.agent.handle_signal(&buf, Instant::now());
-                    }
-                    if closed {
-                        self.drop_signal();
-                        return Ok(());
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    self.drop_signal();
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    fn write_signal(&mut self) {
-        while self.signal_open && self.tls.wants_write() {
-            match self.tls.write_tls(&mut self.tcp) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(_) => self.drop_signal(),
-            }
-        }
-    }
-
-    fn drop_signal(&mut self) {
-        if self.signal_open {
-            self.signal_open = false;
-            let _ = self.tcp.shutdown(std::net::Shutdown::Both);
-            self.agent.signal_closed();
-        }
+        self.signal.pump(&mut self.agent)
     }
 
     /// Receives and handles one datagram. Returns false if none was ready.
     fn recv_one(&mut self, buf: &mut [u8]) -> Result<bool, Error> {
-        match self.socket.recv_from(buf) {
+        let Some(socket) = &self.socket else {
+            return Ok(false);
+        };
+        match socket.recv_from(buf) {
             Ok((n, from)) => {
                 self.agent
                     .handle_packet(canonical(from), &buf[..n], Instant::now());
@@ -329,12 +408,11 @@ impl Client {
                 // address family); others may still work, so send errors are
                 // not fatal. Connectivity is judged by acks, never by sends.
                 Output::Transmit { to, bytes } => {
-                    let _ = self.socket.send_to(&bytes, to);
+                    if let Some(socket) = &self.socket {
+                        let _ = socket.send_to(&bytes, to);
+                    }
                 }
-                // rustls buffers plaintext (also during the handshake);
-                // write_signal moves it to the socket.
-                Output::Signal(bytes) if self.signal_open => self.tls.writer().write_all(&bytes)?,
-                Output::Signal(_) => {}
+                Output::Signal(bytes) => self.signal.write(&bytes)?,
                 Output::Event(e) => self.events.push_back(e),
             }
         }
@@ -342,6 +420,8 @@ impl Client {
     }
 }
 
-fn canonical(addr: SocketAddr) -> SocketAddr {
+/// Maps IPv4-mapped IPv6 addresses to plain IPv4, so addresses compare equal
+/// however the OS reports them.
+pub fn canonical(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }

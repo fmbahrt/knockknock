@@ -29,8 +29,19 @@ pub type SessionId = u64;
 pub enum Mode {
     /// Open a lobby and accept joiners.
     Host,
+    /// Open a lobby whose game port belongs to another transport (ENet): the
+    /// agent's datagrams are sent through it, but nothing is ever received.
+    /// Joiners verify the host's checks; the game confirms each joiner with
+    /// [`Agent::confirm_peer`] or [`Agent::verify_join`].
+    HostSendOnly,
     /// Join an existing lobby.
     Join(LobbyId),
+}
+
+impl Mode {
+    pub fn is_host(self) -> bool {
+        matches!(self, Self::Host | Self::HostSendOnly)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +105,11 @@ pub struct Agent {
     next_heartbeat: Instant,
     heartbeat_id: u32,
     next_stats: Instant,
+    /// Path stats supplied by the game transport (e.g. ENet), reported in
+    /// place of our own measurements.
+    external_stats: HashMap<SessionId, SessionStats>,
+    /// The joiner handed its socket to the game transport: no more BINDs.
+    udp_released: bool,
     last_tick: Instant,
     out: VecDeque<Output>,
 }
@@ -111,7 +127,7 @@ impl Agent {
         now: Instant,
     ) -> Self {
         let pending = match mode {
-            Mode::Host => None,
+            Mode::Host | Mode::HostSendOnly => None,
             Mode::Join(_) => Some(SessionMachine::new(cfg).start()),
         };
         let mut agent = Self {
@@ -125,11 +141,13 @@ impl Agent {
             next_heartbeat: now + cfg.heartbeat_interval,
             heartbeat_id: 0,
             next_stats: now + cfg.stats_interval,
+            external_stats: HashMap::new(),
+            udp_released: false,
             last_tick: now,
             out: VecDeque::new(),
         };
         agent.signal(Message::Register {
-            host: mode == Mode::Host,
+            host: mode.is_host(),
             candidates: local,
         });
         agent
@@ -149,9 +167,78 @@ impl Agent {
         self.sessions.get(&id).map(SessionMachine::state)
     }
 
-    /// Path quality for a session: RTT, jitter and loss from its pings.
+    /// Path quality for a session: RTT, jitter and loss from its pings, or
+    /// what [`Agent::set_stats`] supplied.
     pub fn stats(&self, id: SessionId, now: Instant) -> Option<SessionStats> {
-        self.sessions.get(&id)?.stats(now)
+        let session = self.sessions.get(&id)?;
+        let own = session.stats(now);
+        match self.external_stats.get(&id) {
+            // The session knows its state and path; the transport its quality.
+            Some(st) => Some(SessionStats {
+                state: session.state(),
+                path: st.path.or(own.and_then(|o| o.path)),
+                ..*st
+            }),
+            None => own,
+        }
+    }
+
+    /// Supplies path stats measured by the game transport (e.g. ENet's
+    /// per-peer RTT and loss), reported to the server instead of our own.
+    pub fn set_stats(&mut self, id: SessionId, stats: SessionStats) {
+        if self.sessions.contains_key(&id) {
+            self.external_stats.insert(id, stats);
+        }
+    }
+
+    /// See the join token in `docs/design.md` §15.
+    pub fn join_token(&self, id: SessionId) -> Option<String> {
+        self.sessions.get(&id)?.join_token()
+    }
+
+    /// Send-only host: the game transport saw a peer connect from `addr`.
+    /// Confirms the connecting session that has `addr` among its candidates.
+    pub fn confirm_peer(&mut self, addr: SocketAddr, now: Instant) -> Option<SessionId> {
+        let id = self
+            .sessions
+            .iter()
+            .find(|(_, s)| s.state() == State::Connecting && s.has_candidate(addr))
+            .map(|(&id, _)| id)?;
+        self.step(id, |s, _| s.confirm(addr, now));
+        Some(id)
+    }
+
+    /// Send-only host: a peer at `addr` presented `token` over the game
+    /// transport. Returns its session if the token is valid (confirming the
+    /// session if it was still connecting), or `None` for an impostor.
+    pub fn verify_join(
+        &mut self,
+        token: &str,
+        addr: SocketAddr,
+        now: Instant,
+    ) -> Option<SessionId> {
+        use subtle::ConstantTimeEq;
+        let id = self.sessions.iter().find_map(|(&id, s)| {
+            let valid: bool = s.join_token()?.as_bytes().ct_eq(token.as_bytes()).into();
+            valid.then_some(id)
+        })?;
+        self.step(id, |s, _| s.confirm(addr, now));
+        Some(id)
+    }
+
+    /// Joiner: hands the game socket to another transport (ENet) once
+    /// connected. Stops BINDs and session traffic; signalling stays up so the
+    /// joiner keeps its seat in the lobby. Returns the session and the host
+    /// address to connect the game transport to.
+    pub fn hand_off(&mut self) -> Option<(SessionId, SocketAddr)> {
+        let (id, addr) = self.sessions.iter().find_map(|(&id, s)| match s.state() {
+            State::Connected { addr } => Some((id, addr)),
+            _ => None,
+        })?;
+        self.sessions.remove(&id);
+        self.external_stats.remove(&id);
+        self.udp_released = true;
+        Some((id, addr))
     }
 
     pub fn poll_output(&mut self) -> Option<Output> {
@@ -225,6 +312,7 @@ impl Agent {
             ..
         } = &mut self.signalling
             && now >= *next_bind
+            && !self.udp_released
         {
             // Retry quickly until the first BIND is confirmed, then refresh
             // to keep the NAT mapping (and so the candidate) alive.
@@ -379,21 +467,26 @@ impl Agent {
             return; // duplicate after a retried JOIN
         }
         let session = match (self.mode, role) {
-            (Mode::Host, Role::Controlling) => SessionMachine::new(self.cfg).start(),
+            (Mode::Host | Mode::HostSendOnly, Role::Controlling) => {
+                SessionMachine::new(self.cfg).start()
+            }
             (Mode::Join(_), Role::Controlled) => match self.pending.take() {
                 Some(s) => s,
                 None => return,
             },
             _ => return,
         };
-        let link = Link::new(session_id, role, key);
+        let mut link = Link::new(session_id, role, key);
+        if self.mode == Mode::HostSendOnly {
+            link = link.send_only();
+        }
         self.sessions.insert(session_id, session);
         self.step(session_id, |s, out| s.peer_info(link, candidates, now, out));
     }
 
     /// Hosts report their sessions' path quality to the server.
     fn wants_stats(&self) -> bool {
-        self.mode == Mode::Host
+        self.mode.is_host()
             && matches!(self.signalling, Signalling::Registered { .. })
             && !self.sessions.is_empty()
     }
@@ -402,9 +495,9 @@ impl Agent {
         let micros = |d: Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX - 1);
         let entries: Vec<_> = self
             .sessions
-            .iter()
-            .filter_map(|(&session_id, s)| {
-                let st = s.stats(now)?;
+            .keys()
+            .filter_map(|&session_id| {
+                let st = self.stats(session_id, now)?;
                 let state = match st.state {
                     State::Connecting => ReportedState::Connecting,
                     State::Connected { .. } => ReportedState::Connected,
@@ -448,7 +541,9 @@ impl Agent {
         if after != before {
             self.event(Event::Session { id, state: after });
         }
-        if !session.is_terminal() {
+        if session.is_terminal() {
+            self.external_stats.remove(&id);
+        } else {
             self.sessions.insert(id, session);
         }
     }
@@ -725,5 +820,130 @@ mod tests {
         .unwrap();
         agent.handle_packet(server(), &forged, now);
         assert!(drain(&mut agent).events.is_empty());
+    }
+
+    #[test]
+    fn send_only_host_confirms_peers_and_reports_external_stats() {
+        let now = Instant::now();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::HostSendOnly, now);
+        let d = register(&mut agent, None, now);
+        assert!(matches!(d.events[..], [Event::Registered { .. }]));
+        feed(&mut agent, peer_info(5, Role::Controlling), now);
+        feed(
+            &mut agent,
+            Message::PeerInfo {
+                session_id: 6,
+                role: Role::Controlling,
+                key: [2; 16],
+                candidates: vec![Candidate::host("10.9.9.9:7000".parse().unwrap())],
+            },
+            now,
+        );
+        let d = drain(&mut agent);
+        // Announcing: nominating checks to every candidate, no plain probes.
+        assert!(!d.to_peers.is_empty());
+        assert!(
+            d.to_peers
+                .iter()
+                .all(|p| matches!(p.msg, Message::Check { nominate: true, .. }))
+        );
+
+        // ENet saw a peer connect from session 5's candidate address.
+        let joiner: SocketAddr = "198.51.100.7:6000".parse().unwrap();
+        let (confirmed, other) = (5, 6);
+        assert_eq!(agent.confirm_peer(joiner, now), Some(confirmed));
+        assert_eq!(
+            agent.session_state(confirmed),
+            Some(State::Connected { addr: joiner })
+        );
+
+        // The other joiner proves itself with its token from an unexpected
+        // address (e.g. a symmetric mapping); an impostor's token fails.
+        let token = agent.join_token(other).unwrap();
+        let elsewhere: SocketAddr = "198.51.100.99:1234".parse().unwrap();
+        assert_eq!(
+            agent.verify_join("00112233445566778899aabbccddeeff", elsewhere, now),
+            None
+        );
+        assert_eq!(agent.verify_join(&token, elsewhere, now), Some(other));
+        assert_eq!(
+            agent.session_state(other),
+            Some(State::Connected { addr: elsewhere })
+        );
+        drain(&mut agent);
+
+        // ENet's measurements are what gets reported.
+        agent.set_stats(
+            confirmed,
+            SessionStats {
+                state: State::Connecting, // overridden by the real state
+                path: None,
+                rtt: Some(Duration::from_millis(42)),
+                jitter: Some(Duration::from_millis(3)),
+                loss: 0.25,
+            },
+        );
+        let st = agent.stats(confirmed, now).unwrap();
+        assert_eq!(
+            (st.state, st.rtt),
+            (
+                State::Connected { addr: joiner },
+                Some(Duration::from_millis(42))
+            )
+        );
+        agent.handle_timeout(now + Config::default().stats_interval);
+        let reported = drain(&mut agent).signals.into_iter().find_map(|m| match m {
+            Message::Stats(e) => e.into_iter().find(|e| e.session_id == confirmed),
+            _ => None,
+        });
+        let e = reported.expect("stats for the confirmed session");
+        assert_eq!(
+            (e.state, e.rtt_us, e.rttvar_us, e.loss_permille),
+            (ReportedState::Connected, Some(42_000), Some(3_000), 250)
+        );
+    }
+
+    #[test]
+    fn joiner_hands_off_and_stops_binding() {
+        let now = Instant::now();
+        let lobby: LobbyId = "K7M2QX".parse().unwrap();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Join(lobby), now);
+        register(&mut agent, None, now);
+        assert_eq!(
+            agent.hand_off(),
+            None,
+            "nothing to hand off before connecting"
+        );
+
+        feed(&mut agent, peer_info(7, Role::Controlled), now);
+        drain(&mut agent);
+        let host: SocketAddr = "198.51.100.7:6000".parse().unwrap();
+        let check = Packet {
+            id: 7,
+            seq: 0,
+            msg: Message::Check {
+                txid: 1,
+                nominate: true,
+            },
+        }
+        .encode(&[1; 16], Dir::HostToJoiner)
+        .unwrap();
+        agent.handle_packet(host, &check, now);
+        assert!(drain(&mut agent).events.contains(&Event::Session {
+            id: 7,
+            state: State::Connected { addr: host }
+        }));
+        let token = agent.join_token(7).unwrap();
+
+        assert_eq!(agent.hand_off(), Some((7, host)));
+        assert_eq!(agent.session_state(7), None);
+        assert_eq!(token.len(), 32);
+        // No more BINDs, but signalling (heartbeats) continues.
+        let cfg = Config::default();
+        agent.handle_timeout(now + cfg.heartbeat_interval);
+        let d = drain(&mut agent);
+        assert!(d.to_server.is_empty());
+        assert!(d.signals.iter().any(|m| matches!(m, Message::Ping { .. })));
+        assert!(agent.signal_open());
     }
 }

@@ -31,6 +31,13 @@ pub(crate) fn mac(key: &Key, dir: Dir, packet: &[u8]) -> [u8; TAG_LEN] {
     ctx.sign().as_ref()[..TAG_LEN].try_into().unwrap()
 }
 
+/// `HMAC-SHA256(key, label)`, truncated: a value derived from a key that
+/// reveals nothing about it.
+pub(crate) fn derive(key: &Key, label: &[u8]) -> [u8; TAG_LEN] {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), label);
+    tag.as_ref()[..TAG_LEN].try_into().unwrap()
+}
+
 /// Checks the tag in `packet[16..32]` in constant time.
 pub(crate) fn verify(key: &Key, dir: Dir, packet: &[u8]) -> bool {
     mac(key, dir, packet).ct_eq(&packet[16..HEADER_LEN]).into()

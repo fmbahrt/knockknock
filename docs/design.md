@@ -416,9 +416,24 @@ ENet does not understand. So:
 4. The host learns the outcome when ENet reports `peer_connected` (matched to
    the session by address) or when the session's deadline passes.
 
-The joiner side therefore runs a **send-only-peer mode**: a pair succeeds once
-an authenticated CHECK from the host arrives (no ACK will come back), and
-the joiner nominates that pair itself.
+The joiner needs no special mode. A send-only host's checks all carry the
+`NOMINATE` flag, and a joiner already enters `Connected` on the first
+authenticated nominating check, on the path it arrived from. The host side is
+`Mode::HostSendOnly`:
+- It announces (sends nominating checks to every joiner candidate every
+  `probe_interval`) until the game confirms the joiner, or the session
+  deadline passes.
+- It is confirmed with `Agent::confirm_peer(addr)`, when ENet sees a peer
+  connect from a candidate address, or with `Agent::verify_join(token, addr)`.
+- Once connected it goes quiet; ENet owns liveness.
+- `Agent::set_stats` feeds ENet's RTT, jitter and loss into the `STATS`
+  reports.
+
+**Limitation:** a send-only host can only aim at the joiner's server-reflexive
+mapping, and it never hears the joiner's checks, so it cannot learn a
+peer-reflexive one. A joiner behind a symmetric NAT therefore fails with
+`NoPath` even when the host is behind a forgiving NAT. (A full two-way host
+could still reach it.) Relay is the fix.
 
 ### Admission
 
@@ -428,7 +443,18 @@ it in the game's first RPC; the host calls `Knockknock.verify_join(peer_id,
 token)` and kicks impostors. Games that need confidentiality can enable ENet's
 DTLS.
 
-### GDScript API (sketch)
+### GDScript API
+
+Built in `client/knockknock-godot` (gdext 0.5, `api-4-7`). The example project
+in `godot/` exercises all of it, and `just godot-smoke` runs it headless. Signal
+names below are as built:
+`lobby_opened(lobby_id, local_port)`, `joiner_incoming(session)`,
+`joiner_connected(session, address)`, `joiner_failed(session, reason)`,
+`join_ready(address, port, join_token)`, `join_failed(reason)`, `server_lost`,
+`error(message)`.
+
+The original sketch follows; the as-built API differs in the details noted
+after it.
 
 Two autoload Nodes (Nodes, so they can poll in `_process`):
 
@@ -458,6 +484,17 @@ Knockknock.attach_client(peer.host)  # optional: report the joiner's view too
   `over_packet_peer(udp, session)` (full, two-way) and `over_enet(enet_host,
   address, port, session)` (send-only host). Unlike noray's `$rwx` status
   strings, every packet is authenticated with the session key.
+
+As built:
+- **No `connect_to_server` step.** `host_lobby(server)` and
+  `join_lobby(server, code)` connect, the server certificate's CA is the
+  `ca_file` property, and results arrive as signals rather than return values.
+- **`verify_join` takes the `ENetPacketPeer`**
+  (`multiplayer.multiplayer_peer.get_peer(id)`).
+- **The handshake is built into `join_lobby`**, not exposed as a separate
+  `Handshake` singleton yet. A standalone one needs session credentials, which
+  only come from the server.
+- **No `attach_client` yet.** Joiners don't send ENet stats.
 
 ## 16. Telemetry
 
@@ -536,9 +573,10 @@ dashboard and log.
 5. ✅ Keepalive, failure detection, recovery
 6. ✅ Path statistics (PING/PONG), host reports, server dashboard
 7. ✅ Signalling over TCP/TLS with UDP `BIND` (§14)
-8. Send-only host handshake and joiner hand-off mode (§15)
-9. `knockknock-godot` (gdext, Godot 4.7.2): `Knockknock` + `Handshake`
-   singletons, ENet stats → telemetry, example project
+8. ✅ Send-only host handshake and joiner hand-off (§15)
+9. ✅ `knockknock-godot` (gdext, Godot 4.7.2): `Knockknock` autoload, ENet
+   stats → `STATS`, join tokens, example project, headless smoke test.
+   Still to do: a standalone `Handshake` singleton and joiner-side stats.
 10. Telemetry (§16): joiner reports, handshake reports, events; dashboard
     both-ends view, timelines, aggregates, JSONL log
 11. Relay through the rendezvous server (the `NoPath` fallback)

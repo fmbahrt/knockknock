@@ -54,6 +54,8 @@ pub(crate) struct Link {
     send_seq: u32,
     replay: ReplayWindow,
     next_txid: u64,
+    /// We can send but never receive (a host whose port belongs to ENet).
+    pub send_only: bool,
 }
 
 impl Link {
@@ -65,7 +67,22 @@ impl Link {
             send_seq: 0,
             replay: ReplayWindow::default(),
             next_txid: auth::random_u64(),
+            send_only: false,
         }
+    }
+
+    /// Marks this side as send-only; only meaningful for the host.
+    pub fn send_only(mut self) -> Self {
+        self.send_only = true;
+        self
+    }
+
+    /// A token the joiner presents to the host over the game transport (for
+    /// ENet: in its first RPC), proving it holds this session's key. Both
+    /// sides derive it; it reveals nothing about the key.
+    pub fn join_token(&self) -> String {
+        let tag = auth::derive(&self.key, b"knockknock enet join");
+        tag.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     fn dirs(&self) -> (Dir, Dir) {
@@ -140,6 +157,8 @@ pub(crate) struct Checker {
     pairs: Vec<CandidatePair>,
     first_success: Option<Instant>,
     nomination: Option<Nomination>,
+    /// Send-only hosts: when to next announce to every candidate.
+    next_announce: Option<Instant>,
 }
 
 impl Checker {
@@ -148,6 +167,7 @@ impl Checker {
             pairs: Vec::new(),
             first_success: None,
             nomination: None,
+            next_announce: None,
         };
         for c in candidates {
             checker.add(c);
@@ -197,6 +217,10 @@ impl Checker {
         self.nomination.is_none() && self.pairs.iter().all(|p| p.state == PairState::Failed)
     }
 
+    fn has_candidate(&self, addr: SocketAddr) -> bool {
+        self.pair(addr).is_some()
+    }
+
     fn reset(&mut self) {
         self.pairs.iter_mut().for_each(CandidatePair::retry);
         self.first_success = None;
@@ -204,6 +228,10 @@ impl Checker {
     }
 
     fn tick(&mut self, link: &mut Link, now: Instant, cfg: &Config, out: &mut Vec<Action>) {
+        if link.send_only {
+            self.announce(link, now, cfg, out);
+            return;
+        }
         let mut checking = 0;
         for p in &mut self.pairs {
             p.tick(now, cfg);
@@ -224,6 +252,20 @@ impl Checker {
         }
         if link.role == Role::Controlling {
             self.nominate(link, now, cfg, out);
+        }
+    }
+
+    /// Send-only host: we will never hear acks, so send authenticated,
+    /// nominating checks to every candidate. Each one opens our NAT towards
+    /// that candidate, and the joiner accepts the first that reaches it
+    /// (`docs/design.md` §15). Pairs never fail; the session deadline ends it.
+    fn announce(&mut self, link: &mut Link, now: Instant, cfg: &Config, out: &mut Vec<Action>) {
+        if self.next_announce.is_some_and(|t| now < t) {
+            return;
+        }
+        self.next_announce = Some(now + cfg.probe_interval);
+        for p in &self.pairs {
+            link.check(p.addr(), true, out);
         }
     }
 
@@ -488,6 +530,14 @@ impl Session<Connecting> {
     }
 }
 
+impl Session<Connecting> {
+    /// Send-only host: the game transport (ENet) reports that the joiner at
+    /// `addr` connected, which is the confirmation we cannot receive ourselves.
+    fn confirm(self, addr: SocketAddr, now: Instant) -> SessionMachine {
+        SessionMachine::Connected((self, addr, now).into())
+    }
+}
+
 impl Session<Connected> {
     fn on_packet(
         mut self,
@@ -523,6 +573,10 @@ impl Session<Connected> {
     }
 
     fn on_tick(mut self, now: Instant, out: &mut Vec<Action>) -> SessionMachine {
+        // A send-only host cannot hear the peer: ENet owns liveness now.
+        if self.state.link.send_only {
+            return SessionMachine::Connected(self);
+        }
         let s = &mut self.state;
         if now - s.last_recv >= self.cfg.disconnect_timeout {
             return SessionMachine::Disconnected((self, now).into());
@@ -669,6 +723,42 @@ impl SessionMachine {
 
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Failed(_) | Self::Closed(_))
+    }
+
+    fn link(&self) -> Option<&Link> {
+        match self {
+            Self::Connecting(s) => Some(&s.state.link),
+            Self::Connected(s) => Some(&s.state.link),
+            Self::Disconnected(s) => Some(&s.state.link),
+            _ => None,
+        }
+    }
+
+    fn checker(&self) -> Option<&Checker> {
+        match self {
+            Self::Connecting(s) => Some(&s.state.checker),
+            Self::Connected(s) => Some(&s.state.checker),
+            Self::Disconnected(s) => Some(&s.state.checker),
+            _ => None,
+        }
+    }
+
+    /// See [`Link::join_token`].
+    pub fn join_token(&self) -> Option<String> {
+        self.link().map(Link::join_token)
+    }
+
+    /// Whether `addr` is one of the peer's candidates.
+    pub fn has_candidate(&self, addr: SocketAddr) -> bool {
+        self.checker().is_some_and(|c| c.has_candidate(addr))
+    }
+
+    /// Connecting → Connected on external confirmation (send-only host).
+    pub fn confirm(self, addr: SocketAddr, now: Instant) -> Self {
+        match self {
+            Self::Connecting(s) if s.state.link.send_only => s.confirm(addr, now),
+            other => other,
+        }
     }
 
     /// New → Gathering.

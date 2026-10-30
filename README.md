@@ -13,6 +13,8 @@ then flows directly between them.
 
 - **`rendezvous/`**: the rendezvous server, in Go (standard library only).
 - **`client/`**: the peer library, in Rust (`rustls` + `ring` + `webpki-roots`).
+- **`client/knockknock-godot/`** + **`godot/`**: the Godot 4.7 GDExtension and an
+  example project.
 - **`docs/design.md`**: design, state machines, security model, limitations.
 - **`docs/protocol.md`**: the wire format, plus shared test vectors in `docs/testdata/`.
 
@@ -20,7 +22,7 @@ then flows directly between them.
 
 ```
 .
-├── mise.toml                 # pinned Go, Rust, Python and just versions
+├── mise.toml                 # pinned Go, Rust, Python, Godot and just versions
 ├── justfile                  # top-level tasks; delegates to the modules below
 ├── docs/
 │   ├── design.md             # design spec
@@ -35,7 +37,11 @@ then flows directly between them.
 │       ├── ratelimit/        # per-IP token bucket
 │       ├── registry/         # clients, lobbies, sessions, stats snapshot
 │       └── dashboard/        # web view of lobbies and connection stats
+├── godot/                    # example Godot project
+│   ├── main.gd               # host/join UI + chat; headless smoke test mode
+│   └── addons/knockknock/    # the addon: .gdextension, plugin, Knockknock autoload
 └── client/                   # Cargo workspace
+    ├── knockknock-godot/     # GDExtension (gdext) wrapping the library
     └── knockknock/           # library crate
         ├── src/protocol.rs   # packet encoding/decoding
         ├── src/auth.rs       # HMAC tags, replay window
@@ -48,7 +54,8 @@ then flows directly between them.
         ├── src/sim.rs        # NAT/loss simulation tests
         └── examples/         # host.rs, join.rs, bridge.rs (stdin/stdout driver)
 scripts/
-└── datatest.py               # traffic tests over real connections (stdlib only)
+├── datatest.py               # traffic tests over real connections (stdlib only)
+└── godot                     # runs the Godot pinned in mise.toml
 ```
 
 ## Getting started
@@ -142,10 +149,48 @@ JSON.
 
 Target: Godot 4.7.2. knockknock does matchmaking and the authenticated
 handshake, then hands the punched port to Godot's own `ENetMultiplayerPeer`,
-in the style of netfox.noray. Hosts and joiners can also send path stats,
-handshake reports and debug events to the rendezvous server for the dashboard.
-See [design.md §15–16](docs/design.md#15-godot-integration-hand-off-to-enet).
-The GDExtension is not built yet.
+in the style of netfox.noray. Reliable RPCs, `MultiplayerSynchronizer` and the
+rest of Godot's high-level multiplayer work unchanged.
+
+```sh
+just rendezvous::run          # local server; writes bin/dev-ca.pem
+just godot-editor             # builds the extension, opens godot/ in the editor
+just godot-smoke              # headless host + joiner end to end in real Godot
+```
+
+```gdscript
+# Host
+Knockknock.host_lobby("rv.example.com:7777")
+var opened = await Knockknock.lobby_opened            # [lobby_id, local_port]
+var peer := ENetMultiplayerPeer.new()
+peer.create_server(opened[1], 7)
+Knockknock.attach_host(peer.host)   # punches for joiners via ENet, reports ENet stats
+multiplayer.multiplayer_peer = peer
+
+# Joiner
+Knockknock.join_lobby("rv.example.com:7777", "K7M2QX")
+var ready = await Knockknock.join_ready                # [address, port, join_token]
+var peer := ENetMultiplayerPeer.new()
+peer.create_client(ready[0], ready[1], 0, 0, 0, Knockknock.get_local_port())
+multiplayer.multiplayer_peer = peer
+# …then send ready[2] to the host in your first RPC; the host checks it with
+# Knockknock.verify_join(multiplayer.multiplayer_peer.get_peer(id), token)
+```
+
+Set `Knockknock.ca_file` to a CA file (e.g. `res://dev-ca.pem`) for a server
+without a public certificate. To use the addon in your own project, copy
+`godot/addons/knockknock` (with the built library in `bin/`) and enable the
+plugin; it registers the `Knockknock` autoload. See
+[design.md §15](docs/design.md#15-godot-integration-hand-off-to-enet) for how
+the hand-off works.
+
+Known issues:
+- With gdext 0.5.5 and Godot 4.7.2, the headless editor crashes on exit after
+  a project's very first import. It reproduces with an empty gdext extension,
+  so it is upstream. Later imports and game runs are unaffected, and
+  `just godot-smoke` retries.
+- A joiner behind a symmetric NAT cannot reach a send-only host
+  (design §15). Relay will fix this.
 
 ## Limitations
 

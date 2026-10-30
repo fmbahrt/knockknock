@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Runs the Godot pinned in mise.toml (mise's github backend unpacks the
+# release archive; the binary's location differs per OS).
+set -euo pipefail
+dir=$(mise where "github:godotengine/godot")
+case "$(uname -s)" in
+  Darwin) bin="$dir/Contents/MacOS/Godot" ;;
+  *) bin=$(find "$dir" -maxdepth 2 -type f -name 'Godot_v*' ! -name '*console*' | head -n1) ;;
+esac
+exec "$bin" "$@"

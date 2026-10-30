@@ -9,6 +9,8 @@
 //! `std::net::UdpSocket` for the game. For custom I/O (e.g. a game engine's
 //! loop), drive an [`Agent`] directly.
 
+#![forbid(unsafe_code)]
+
 mod agent;
 mod auth;
 pub mod candidate;
@@ -24,7 +26,7 @@ use std::time::Duration;
 use std::{fmt, io};
 
 pub use agent::{Agent, Event, Mode, Output, SessionId};
-pub use client::{Client, ServerTrust};
+pub use client::{Client, ServerTrust, SignalConn, canonical};
 pub use pair::PairState;
 pub use protocol::{ErrorCode, LobbyId, ProtocolError};
 pub use session::{FailReason, State};
@@ -107,6 +109,11 @@ impl fmt::Display for Error {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Protocol(e) => write!(f, "protocol: {e}"),
+            Self::Tls(e @ rustls::Error::InvalidCertificate(_)) => write!(
+                f,
+                "tls: {e}: the server's certificate is not signed by a CA this client trusts \
+                 (for a development server, copy its current dev-ca.pem)"
+            ),
             Self::Tls(e) => write!(f, "tls: {e}"),
             Self::Server(code) => write!(f, "server: {code}"),
             Self::Timeout => f.write_str("timed out"),
