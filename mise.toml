@@ -1,0 +1,8 @@
+[tools]
+go = "1.27.3"
+rust = "1.99.1"
+just = "1.59.0"
+
+[env]
+# Use the Go pinned above instead of silently downloading another toolchain.
+GOTOOLCHAIN = "local"

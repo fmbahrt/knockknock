@@ -1,0 +1,28 @@
+# Go rendezvous server
+
+bin := "../bin/rendezvous"
+
+# Build the server binary into bin/
+build:
+    go build -o {{ bin }} ./cmd/rendezvous
+
+# Run the server
+run *args:
+    go run ./cmd/rendezvous {{ args }}
+
+# Run tests
+test:
+    go test -race ./...
+
+# Vet and check formatting
+lint:
+    go vet ./...
+    test -z "$(gofmt -l .)" || (gofmt -l . && echo "run: just fmt" && exit 1)
+
+# Format code
+fmt:
+    gofmt -w .
+
+# Remove build artifacts
+clean:
+    rm -f {{ bin }}

@@ -1,0 +1,30 @@
+# Rust client library
+
+# Build the library and examples
+build:
+    cargo build --all-targets
+
+# Open a lobby: just client::host <server-addr> [players]
+host *args:
+    cargo run --example host -- {{ args }}
+
+# Join a lobby: just client::join <server-addr> <lobby-id> [name]
+join *args:
+    cargo run --example join -- {{ args }}
+
+# Run tests
+test:
+    cargo test
+
+# Run clippy and check formatting
+lint:
+    cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
+
+# Format code
+fmt:
+    cargo fmt
+
+# Remove build artifacts
+clean:
+    cargo clean
