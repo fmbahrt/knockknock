@@ -1,17 +1,19 @@
-// Package registry implements the knockknock rendezvous server: it registers
-// clients, hands out lobby IDs to hosts, and introduces joiners to hosts so
-// they can punch through their NATs.
+// Package registry implements the knockknock rendezvous server: clients
+// register over TLS, hosts get lobby IDs, and joiners are introduced to hosts
+// so they can punch through their NATs. Over UDP the server only receives
+// BINDs, which reveal each client's public game endpoint; it never sends UDP.
 package registry
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"time"
 
@@ -21,32 +23,64 @@ import (
 )
 
 type Config struct {
-	// TTL is how long a client stays registered without refreshing.
-	TTL time.Duration
+	// BindInterval is how often clients refresh their UDP binding.
+	BindInterval time.Duration
+	// IdleTimeout drops signalling connections that send nothing (clients
+	// heartbeat well within it).
+	IdleTimeout time.Duration
+	// HandshakeTimeout bounds the TLS handshake plus REGISTER.
+	HandshakeTimeout time.Duration
+	// PingInterval is how often the server pings each client over TLS to
+	// measure client↔server latency.
+	PingInterval time.Duration
 	// MaxLobby is the maximum number of peers in a lobby, host included.
 	MaxLobby int
-	// Rate and Burst limit unauthenticated requests and joins per source IP.
+	// Rate and Burst limit new connections and joins per source IP.
 	Rate  float64
 	Burst int
 }
 
 func DefaultConfig() Config {
-	return Config{TTL: 60 * time.Second, MaxLobby: 8, Rate: 5, Burst: 20}
+	return Config{
+		BindInterval:     15 * time.Second,
+		IdleTimeout:      90 * time.Second,
+		HandshakeTimeout: 10 * time.Second,
+		PingInterval:     10 * time.Second,
+		MaxLobby:         8,
+		Rate:             5,
+		Burst:            20,
+	}
 }
+
+// outQueue bounds how many frames may wait for a slow client before it is
+// disconnected.
+const outQueue = 64
 
 type client struct {
 	id         uint64
 	secret     auth.Key
-	pending    pendingKey
-	observed   netip.AddrPort
+	ip         netip.Addr // of the signalling connection
+	conn       net.Conn
+	out        chan []byte
+	closed     bool
+	observed   netip.AddrPort // public game endpoint; invalid until the first BIND
 	candidates []protocol.Candidate
-	seen       time.Time
 	recvWindow auth.ReplayWindow
-	sendSeq    uint32
+	connected  time.Time
+	lastBind   time.Time
+	rebinds    int    // public endpoint changes after the first BIND
+	dropReason string // why the server closed the connection, if it did
+
+	// Latency of the signalling connection, from server PINGs.
+	pingID   uint32
+	pingSent time.Time // zero when no ping is outstanding
+	srtt     time.Duration
 
 	lobby   *lobby   // set if this client hosts a lobby
 	session *session // set if this client joined a lobby
 }
+
+func (c *client) bound() bool { return c.observed.IsValid() }
 
 type lobby struct {
 	id       protocol.LobbyID
@@ -65,184 +99,368 @@ type session struct {
 	statsAt time.Time             // zero until the host reports
 }
 
-// pendingKey identifies a first-time registration so retries are idempotent.
-type pendingKey struct {
-	addr  netip.AddrPort
-	nonce uint64
-}
-
-// Server handles all packets on a single goroutine. mu guards its state
-// against concurrent Snapshot calls.
+// Server state is shared between the UDP loop, one goroutine per signalling
+// connection, and Snapshot; mu guards all of it.
 type Server struct {
-	conn    *net.UDPConn
+	udp     *net.UDPConn
+	tls     *tls.Config
 	cfg     Config
 	log     *slog.Logger
-	limiter *ratelimit.Limiter
 	now     func() time.Time
 	started time.Time
 
 	mu       sync.Mutex
+	limiter  *ratelimit.Limiter
 	clients  map[uint64]*client
-	pending  map[pendingKey]*client
 	lobbies  map[protocol.LobbyID]*lobby
 	sessions map[uint64]*session
+
+	counters        Counters
+	clientLifetimes durations
+	lobbyLifetimes  durations
 }
 
-func New(conn *net.UDPConn, cfg Config, log *slog.Logger) *Server {
+func New(udp *net.UDPConn, tlsConfig *tls.Config, cfg Config, log *slog.Logger) *Server {
 	return &Server{
-		conn:     conn,
+		udp:      udp,
+		tls:      tlsConfig,
 		cfg:      cfg,
 		log:      log,
-		limiter:  ratelimit.New(cfg.Rate, cfg.Burst),
 		now:      time.Now,
 		started:  time.Now(),
+		limiter:  ratelimit.New(cfg.Rate, cfg.Burst),
 		clients:  make(map[uint64]*client),
-		pending:  make(map[pendingKey]*client),
 		lobbies:  make(map[protocol.LobbyID]*lobby),
 		sessions: make(map[uint64]*session),
+		counters: newCounters(),
 	}
 }
 
-// Serve handles packets until ctx is cancelled. It closes conn on return.
-func (s *Server) Serve(ctx context.Context) error {
+// Serve accepts signalling connections on ln (plain TCP; TLS is added here)
+// and BINDs on the UDP socket until ctx is cancelled. It closes both.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
 		<-ctx.Done()
-		s.conn.Close()
+		s.udp.Close()
+		ln.Close()
 	}()
 
-	buf := make([]byte, 1500)
-	nextReap := s.now().Add(s.cfg.TTL / 4)
+	var conns sync.WaitGroup
+	errc := make(chan error, 2)
+	go func() { errc <- s.serveUDP(ctx) }()
+	go func() { errc <- s.serveTCP(ctx, tls.NewListener(ln, s.tls), &conns) }()
+	go s.pruneLimiter(ctx)
+	go s.pingClients(ctx)
+
+	err := <-errc
+	cancel()
+	<-errc
+	conns.Wait()
+	return err
+}
+
+func (s *Server) serveTCP(ctx context.Context, ln net.Listener, conns *sync.WaitGroup) error {
 	for {
-		s.conn.SetReadDeadline(nextReap)
-		n, from, err := s.conn.ReadFromUDPAddrPort(buf)
-		switch {
-		case ctx.Err() != nil:
-			return nil
-		case errors.Is(err, os.ErrDeadlineExceeded):
-		case err != nil:
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
-		default:
-			s.handle(buf[:n], netip.AddrPortFrom(from.Addr().Unmap(), from.Port()))
 		}
-		if now := s.now(); !now.Before(nextReap) {
-			s.reap(now)
-			nextReap = now.Add(s.cfg.TTL / 4)
+		ip := addrOf(conn.RemoteAddr()).Addr()
+		s.mu.Lock()
+		s.counters.Connections++
+		allowed := s.limiter.Allow(ip, s.now())
+		if !allowed {
+			s.counters.RateLimited++
+		}
+		s.mu.Unlock()
+		if !allowed {
+			s.log.Debug("rate limited connection", "ip", ip)
+			conn.Close()
+			continue
+		}
+		conns.Add(1)
+		go func() {
+			defer conns.Done()
+			s.serveConn(ctx, conn, ip)
+		}()
+	}
+}
+
+func (s *Server) serveConn(ctx context.Context, conn net.Conn, ip netip.Addr) {
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+
+	// The first frame (read through the TLS handshake) must be REGISTER.
+	conn.SetDeadline(s.now().Add(s.cfg.HandshakeTimeout))
+	msg, err := protocol.ReadFrame(conn)
+	reg, ok := msg.(*protocol.Register)
+	if err != nil || !ok {
+		s.log.Debug("handshake failed", "ip", ip, "err", err)
+		s.mu.Lock()
+		s.counters.HandshakeFailures++
+		s.mu.Unlock()
+		if err == nil {
+			if b, err := protocol.AppendFrame(nil, &protocol.Error{Code: protocol.ErrBadRequest}); err == nil {
+				conn.Write(b)
+			}
+		}
+		return
+	}
+	conn.SetDeadline(time.Time{})
+
+	c := s.register(conn, ip, reg)
+	reason := reasonError
+	defer func() { s.disconnect(c, reason) }()
+	for {
+		conn.SetReadDeadline(s.now().Add(s.cfg.IdleTimeout))
+		msg, err := protocol.ReadFrame(conn)
+		if err != nil {
+			reason = s.readFailure(ctx, c, err)
+			s.log.Debug("connection ended", "client", c.id, "reason", reason, "err", err)
+			return
+		}
+		if ok, why := s.handleFrame(c, msg); !ok {
+			reason = why
+			return
 		}
 	}
 }
 
-func (s *Server) handle(b []byte, from netip.AddrPort) {
+// readFailure classifies why reading from a client's connection failed.
+func (s *Server) readFailure(ctx context.Context, c *client, err error) string {
+	s.mu.Lock()
+	dropped := c.dropReason
+	s.mu.Unlock()
+	var netErr net.Error
+	switch {
+	case ctx.Err() != nil:
+		return reasonShutdown
+	case dropped != "":
+		return dropped
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return reasonClosed
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return reasonIdle
+	case errors.Is(err, protocol.ErrBadField), errors.Is(err, protocol.ErrUnknownType),
+		errors.Is(err, protocol.ErrShort), errors.Is(err, protocol.ErrTrailing):
+		return reasonProtocol
+	default:
+		return reasonError
+	}
+}
+
+func (s *Server) register(conn net.Conn, ip netip.Addr, m *protocol.Register) *client {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	pkt, err := protocol.Decode(b)
-	if err != nil {
-		s.log.Debug("dropping packet", "from", from, "err", err)
-		return
-	}
-
-	if m, ok := pkt.Msg.(*protocol.Register); ok && pkt.ID == 0 {
-		s.registerNew(m, from)
-		return
-	}
-
-	c := s.authenticate(pkt, b, from)
-	if c == nil {
-		return
-	}
-	switch m := pkt.Msg.(type) {
-	case *protocol.Register:
-		c.candidates = m.Candidates
-		s.sendRegistered(c, m.Nonce)
-	case *protocol.Join:
-		s.join(c, m, pkt.Seq, from)
-	case *protocol.Stats:
-		s.recordStats(c, m)
-	case *protocol.Close:
-		s.log.Info("client left", "client", c.id)
-		s.removeClient(c)
-	default:
-		s.log.Debug("unexpected message", "from", from, "type", pkt.Msg.Type())
-	}
-}
-
-func (s *Server) registerNew(m *protocol.Register, from netip.AddrPort) {
-	key := pendingKey{from, m.Nonce}
-	if c, ok := s.pending[key]; ok {
-		s.sendRegistered(c, m.Nonce)
-		return
-	}
-	if !s.limiter.Allow(from.Addr(), s.now()) {
-		s.log.Debug("rate limited", "from", from)
-		return
-	}
 
 	c := &client{
 		id:         s.newID(func(id uint64) bool { return s.clients[id] != nil }),
 		secret:     auth.NewKey(),
-		pending:    key,
-		observed:   from,
+		ip:         ip,
+		conn:       conn,
+		out:        make(chan []byte, outQueue),
 		candidates: m.Candidates,
-		seen:       s.now(),
+		connected:  s.now(),
 	}
+	go s.writeLoop(c)
 	s.clients[c.id] = c
-	s.pending[key] = c
+	if m.Host {
+		s.counters.Hosts++
+	} else {
+		s.counters.Players++
+	}
 	if m.Host {
 		l := &lobby{id: s.newLobbyID(), host: c, sessions: make(map[uint64]*session), created: s.now()}
 		s.lobbies[l.id] = l
 		c.lobby = l
 	}
-	s.log.Info("registered", "client", c.id, "observed", from, "lobby", c.lobbyID())
-	s.sendRegistered(c, m.Nonce)
+	s.log.Info("registered", "client", c.id, "ip", ip, "lobby", c.lobbyID())
+	s.send(c, &protocol.Registered{
+		ClientID: c.id,
+		Secret:   c.secret,
+		Lobby:    c.lobbyID(),
+		BindSecs: uint16(s.cfg.BindInterval / time.Second),
+	})
+	return c
 }
 
-// authenticate returns the client that sent pkt, or nil (after replying with
-// an error where appropriate) if the packet is not authentic.
-func (s *Server) authenticate(pkt protocol.Packet, b []byte, from netip.AddrPort) *client {
-	c, ok := s.clients[pkt.ID]
-	var code protocol.ErrorCode
-	switch {
-	case !ok:
-		code = protocol.ErrUnknownClient
-	case !protocol.Verify(b, c.secret, auth.ClientToServer):
-		code = protocol.ErrBadAuth
-	case !c.recvWindow.Accept(pkt.Seq):
-		s.log.Debug("replayed packet", "client", c.id, "seq", pkt.Seq)
-		return nil
+func (s *Server) writeLoop(c *client) {
+	for b := range c.out {
+		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := c.conn.Write(b); err != nil {
+			s.mu.Lock()
+			if c.dropReason == "" {
+				c.dropReason = reasonWrite
+			}
+			s.mu.Unlock()
+			c.conn.Close() // ends the read loop, which cleans up
+			return
+		}
+	}
+}
+
+func (s *Server) disconnect(c *client, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log.Info("client left", "client", c.id, "reason", reason)
+	now := s.now()
+	s.counters.Disconnects[reason]++
+	s.clientLifetimes.add(now.Sub(c.connected))
+	if c.lobby != nil {
+		s.lobbyLifetimes.add(now.Sub(c.lobby.created))
+	}
+	s.removeClient(c)
+}
+
+// handleFrame processes one frame from a registered client. It returns false
+// and a disconnect reason when the connection should be closed.
+func (s *Server) handleFrame(c *client, msg protocol.Message) (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch m := msg.(type) {
+	case *protocol.Join:
+		s.join(c, m)
+	case *protocol.Stats:
+		s.recordStats(c, m)
+	case *protocol.Ping:
+		s.send(c, &protocol.Pong{ID: m.ID})
+	case *protocol.Pong:
+		s.recordPong(c, m.ID)
+	case *protocol.Close:
+		return false, reasonLeft
 	default:
-		c.seen = s.now()
-		c.observed = from // follow NAT rebinding
-		return c
+		s.send(c, &protocol.Error{Code: protocol.ErrBadRequest})
+		return false, reasonBadRequest
 	}
-
-	// CLOSE is never answered, and errors are rate limited, so neither can
-	// be used for reflection.
-	if pkt.Msg.Type() != protocol.TypeClose && s.limiter.Allow(from.Addr(), s.now()) {
-		s.sendUnauthenticated(from, &protocol.Error{Code: code, RefSeq: pkt.Seq})
-	}
-	return nil
+	return true, ""
 }
 
-func (s *Server) join(c *client, m *protocol.Join, seq uint32, from netip.AddrPort) {
-	if c.session != nil && c.session.lobby.id == m.Lobby {
-		s.introduce(c.session) // retried JOIN
+// pingClients periodically pings every client over TLS so the dashboard can
+// show client↔server latency.
+func (s *Server) pingClients(ctx context.Context) {
+	t := time.NewTicker(s.cfg.PingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			s.mu.Lock()
+			for _, c := range s.clients {
+				c.pingID++
+				c.pingSent = now
+				s.send(c, &protocol.Ping{ID: c.pingID})
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
+// recordPong updates the smoothed latency (RFC 6298 gain, as on the client)
+// when a pong answers the outstanding ping. It includes the time the client
+// takes to service its connection.
+func (s *Server) recordPong(c *client, id uint32) {
+	if id != c.pingID || c.pingSent.IsZero() {
 		return
 	}
-	if !s.limiter.Allow(from.Addr(), s.now()) {
-		s.log.Debug("rate limited", "from", from)
+	rtt := s.now().Sub(c.pingSent)
+	c.pingSent = time.Time{}
+	if c.srtt == 0 {
+		c.srtt = rtt
+	} else {
+		c.srtt = (7*c.srtt + rtt) / 8
+	}
+}
+
+func (s *Server) serveUDP(ctx context.Context) error {
+	buf := make([]byte, 1500)
+	for {
+		n, from, err := s.udp.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		s.handleBind(buf[:n], netip.AddrPortFrom(from.Addr().Unmap(), from.Port()))
+	}
+}
+
+// handleBind records the public endpoint an authenticated BIND came from and
+// tells the client over TLS when it changes. Nothing is ever sent over UDP, so
+// spoofed or forged packets cost the sender more than the server.
+func (s *Server) handleBind(b []byte, from netip.AddrPort) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pkt, err := protocol.Decode(b)
+	if err != nil {
+		s.counters.BindsRejected[bindMalformed]++
+		return
+	}
+	if _, ok := pkt.Msg.(*protocol.Bind); !ok {
+		s.counters.BindsRejected[bindMalformed]++
+		return
+	}
+	c, ok := s.clients[pkt.ID]
+	switch {
+	case !ok || c.closed:
+		s.counters.BindsRejected[bindUnknownClient]++
+		return
+	case !protocol.Verify(b, c.secret, auth.ClientToServer):
+		s.counters.BindsRejected[bindBadMAC]++
+		return
+	case !c.recvWindow.Accept(pkt.Seq):
+		s.counters.BindsRejected[bindReplay]++
+		return
+	}
+	c.lastBind = s.now()
+	if c.observed != from {
+		if c.bound() {
+			c.rebinds++
+			s.counters.Rebinds++
+		}
+		c.observed = from
+		s.log.Info("bound", "client", c.id, "observed", from)
+		s.send(c, &protocol.Bound{Observed: from})
+	}
+}
+
+func (s *Server) join(c *client, m *protocol.Join) {
+	if c.session != nil && c.session.lobby.id == m.Lobby {
+		s.counters.Joins[joinRetry]++
+		s.introduce(c.session)
+		return
+	}
+	fail := func(outcome string, code protocol.ErrorCode) {
+		s.counters.Joins[outcome]++
+		s.send(c, &protocol.Error{Code: code})
+	}
+	if !s.limiter.Allow(c.ip, s.now()) {
+		fail(joinRateLimit, protocol.ErrRateLimited)
+		return
+	}
+	if !c.bound() {
+		fail(joinNotBound, protocol.ErrBadRequest)
 		return
 	}
 	l, ok := s.lobbies[m.Lobby]
-	if !ok || l.host == c {
-		s.send(c, &protocol.Error{Code: protocol.ErrLobbyNotFound, RefSeq: seq})
+	if !ok || l.host == c || !l.host.bound() {
+		fail(joinNotFound, protocol.ErrLobbyNotFound)
 		return
 	}
 	if len(l.sessions)+1 >= s.cfg.MaxLobby {
-		s.send(c, &protocol.Error{Code: protocol.ErrLobbyFull, RefSeq: seq})
+		fail(joinFull, protocol.ErrLobbyFull)
 		return
 	}
+	s.counters.Joins[joinOK]++
 	if c.session != nil {
 		s.removeSession(c.session)
 	}
@@ -282,54 +500,33 @@ func (s *Server) introduce(sess *session) {
 	s.send(joiner, &protocol.PeerInfo{SessionID: sess.id, Role: protocol.RoleControlled, Key: sess.key, Candidates: host.allCandidates()})
 }
 
-func (s *Server) sendRegistered(c *client, nonce uint64) {
-	s.send(c, &protocol.Registered{
-		Nonce:    nonce,
-		Secret:   c.secret,
-		Observed: c.observed,
-		Lobby:    c.lobbyID(),
-		TTLSecs:  uint16(s.cfg.TTL / time.Second),
-	})
-}
-
+// send queues a frame for c. A client too slow to drain its queue is
+// disconnected rather than allowed to stall the server. Callers hold mu.
 func (s *Server) send(c *client, m protocol.Message) {
-	b, err := protocol.Seal(nil, protocol.Packet{ID: c.id, Seq: c.sendSeq, Msg: m}, &c.secret, auth.ServerToClient)
+	if c.closed {
+		return
+	}
+	b, err := protocol.AppendFrame(nil, m)
 	if err != nil {
 		s.log.Error("encode", "type", m.Type(), "err", err)
 		return
 	}
-	c.sendSeq++
-	s.write(b, c.observed)
-}
-
-func (s *Server) sendUnauthenticated(to netip.AddrPort, m protocol.Message) {
-	b, err := protocol.Seal(nil, protocol.Packet{Msg: m}, nil, 0)
-	if err != nil {
-		s.log.Error("encode", "type", m.Type(), "err", err)
-		return
-	}
-	s.write(b, to)
-}
-
-func (s *Server) write(b []byte, to netip.AddrPort) {
-	if _, err := s.conn.WriteToUDPAddrPort(b, to); err != nil {
-		s.log.Warn("send", "to", to, "err", err)
-	}
-}
-
-func (s *Server) reap(now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, c := range s.clients {
-		if now.Sub(c.seen) > s.cfg.TTL {
-			s.log.Info("expired", "client", c.id)
-			s.removeClient(c)
+	select {
+	case c.out <- b:
+	default:
+		s.log.Warn("client too slow, disconnecting", "client", c.id)
+		if c.dropReason == "" {
+			c.dropReason = reasonSlow
+			s.counters.SlowDropped++
 		}
+		c.conn.Close()
 	}
-	s.limiter.Prune(now)
 }
 
 func (s *Server) removeClient(c *client) {
+	if c.closed {
+		return
+	}
 	if c.lobby != nil {
 		for _, sess := range c.lobby.sessions {
 			s.removeSession(sess)
@@ -340,13 +537,29 @@ func (s *Server) removeClient(c *client) {
 		s.removeSession(c.session)
 	}
 	delete(s.clients, c.id)
-	delete(s.pending, c.pending)
+	c.closed = true
+	close(c.out)
 }
 
 func (s *Server) removeSession(sess *session) {
 	delete(s.sessions, sess.id)
 	delete(sess.lobby.sessions, sess.id)
 	sess.joiner.session = nil
+}
+
+func (s *Server) pruneLimiter(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			s.mu.Lock()
+			s.limiter.Prune(now)
+			s.mu.Unlock()
+		}
+	}
 }
 
 // newID returns a random non-zero ID for which taken returns false.
@@ -385,4 +598,12 @@ func (c *client) allCandidates() []protocol.Candidate {
 		}
 	}
 	return cs
+}
+
+func addrOf(a net.Addr) netip.AddrPort {
+	if tcp, ok := a.(*net.TCPAddr); ok {
+		ap := tcp.AddrPort()
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	}
+	return netip.AddrPort{}
 }

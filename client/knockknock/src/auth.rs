@@ -1,11 +1,8 @@
 //! Packet authentication and replay protection (`docs/protocol.md`).
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
+use subtle::ConstantTimeEq;
 
 use crate::protocol::HEADER_LEN;
 
@@ -24,26 +21,19 @@ pub enum Dir {
     JoinerToHost = 0x04,
 }
 
-fn hmac(key: &Key, dir: Dir, packet: &[u8]) -> Hmac<Sha256> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(&[dir as u8]);
-    mac.update(&packet[..16]);
-    mac.update(&packet[HEADER_LEN..]);
-    mac
-}
-
 /// `HMAC-SHA256(key, dir ‖ packet[0..16] ‖ packet[32..])`, truncated.
 /// `packet` must be at least `HEADER_LEN` bytes.
 pub(crate) fn mac(key: &Key, dir: Dir, packet: &[u8]) -> [u8; TAG_LEN] {
-    let full = hmac(key, dir, packet).finalize().into_bytes();
-    full[..TAG_LEN].try_into().unwrap()
+    let mut ctx = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, key));
+    ctx.update(&[dir as u8]);
+    ctx.update(&packet[..16]);
+    ctx.update(&packet[HEADER_LEN..]);
+    ctx.sign().as_ref()[..TAG_LEN].try_into().unwrap()
 }
 
 /// Checks the tag in `packet[16..32]` in constant time.
 pub(crate) fn verify(key: &Key, dir: Dir, packet: &[u8]) -> bool {
-    hmac(key, dir, packet)
-        .verify_truncated_left(&packet[16..HEADER_LEN])
-        .is_ok()
+    mac(key, dir, packet).ct_eq(&packet[16..HEADER_LEN]).into()
 }
 
 /// Tracks the last 64 sequence numbers seen in one direction.
@@ -82,24 +72,15 @@ impl ReplayWindow {
         }
         true
     }
-
-    /// Whether any packet has been accepted yet.
-    pub fn any(&self) -> bool {
-        self.init
-    }
 }
 
-/// An unpredictable 64-bit value, used for registration nonces.
-///
-/// The standard library has no public CSPRNG, but `RandomState` keys SipHash
-/// from OS randomness. Hashing a counter with it yields values an off-path
-/// attacker cannot predict, which is all a nonce needs. Keys come from the
-/// server's CSPRNG, not from here.
+/// A random 64-bit value from the OS CSPRNG.
 pub(crate) fn random_u64() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut h = RandomState::new().build_hasher();
-    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-    h.finish()
+    let mut b = [0u8; 8];
+    SystemRandom::new()
+        .fill(&mut b)
+        .expect("the OS random number generator is available");
+    u64::from_be_bytes(b)
 }
 
 #[cfg(test)]

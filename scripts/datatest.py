@@ -8,7 +8,7 @@ stdin/stdout. Then either benchmarks echo traffic or lets you chat.
     just datatest bench                      # 2 joiners, 500 messages each
     just datatest bench --players 4 --count 2000 --size 1000 --rate 500
     just datatest chat
-    just datatest --server 1.2.3.4:7777 bench   # against a remote server
+    just datatest --server rv.example.com:7777 bench   # against a remote server
 
 Latencies measured here include the bridge's stdin/stdout hop (about a
 millisecond or two); the "library stats" section shows the client's own
@@ -26,6 +26,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -144,10 +145,18 @@ class Lobby:
             self.server.wait()
 
 
-def free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def free_port() -> int:
+    """A port that is currently free for both TCP and UDP."""
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+            t.bind(("127.0.0.1", 0))
+            port = t.getsockname()[1]
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+                try:
+                    u.bind(("127.0.0.1", port))
+                    return port
+                except OSError:
+                    continue
 
 
 def start(args: argparse.Namespace) -> Lobby:
@@ -157,14 +166,20 @@ def start(args: argparse.Namespace) -> Lobby:
 
     server_proc = None
     server = args.server
+    if args.ca:
+        os.environ["KNOCKKNOCK_CA"] = args.ca
     if not server:
-        server = f"127.0.0.1:{free_udp_port()}"
+        server = f"127.0.0.1:{free_port()}"
+        ca = Path(tempfile.mkdtemp()) / "ca.pem"
         http = ["-http", args.dashboard] if args.dashboard else ["-http", ""]
         server_proc = subprocess.Popen(
-            [str(SERVER), "-addr", server, *http],
+            [str(SERVER), "-addr", server, "-tls-dev-ca", str(ca), *http],
             stderr=None if args.verbose else subprocess.DEVNULL,
         )
-        time.sleep(0.2)
+        deadline = time.monotonic() + 5
+        while not (ca.exists() and ca.stat().st_size) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.environ["KNOCKKNOCK_CA"] = str(ca)
         log(f"server   {server}" + (f"  (dashboard http://{args.dashboard})" if args.dashboard else ""))
 
     host = Bridge("host", server)
@@ -337,7 +352,8 @@ def chat(lobby: Lobby, _args: argparse.Namespace) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--server", help="use this rendezvous server instead of starting one")
+    p.add_argument("--server", help="use this rendezvous server (host:port) instead of starting one")
+    p.add_argument("--ca", help="CA certificate (PEM) to trust for --server; default: public roots")
     p.add_argument("--players", type=int, default=2, help="number of joiners (default 2, max 7)")
     p.add_argument("--dashboard", metavar="ADDR", help="serve the local server's dashboard here, e.g. 127.0.0.1:8080")
     p.add_argument("-v", "--verbose", action="store_true", help="show every bridge event and the server log")

@@ -1,19 +1,22 @@
-//! The sans-IO peer: registration with the rendezvous server, lobby hosting
-//! or joining, and routing of packets to sessions. One `Agent` owns one UDP
+//! The sans-IO peer: signalling with the rendezvous server, lobby hosting or
+//! joining, and routing of packets to sessions. One `Agent` owns one game
 //! socket's worth of state. The caller moves bytes and time in and out:
 //!
-//! - feed received datagrams to [`Agent::handle_packet`],
+//! - feed UDP datagrams to [`Agent::handle_packet`] and decrypted bytes from
+//!   the TLS signalling stream to [`Agent::handle_signal`],
 //! - call [`Agent::handle_timeout`] when [`Agent::poll_timeout`] is reached,
-//! - drain [`Agent::poll_output`] and send the datagrams it returns.
+//! - drain [`Agent::poll_output`]: send `Transmit`s over UDP and write
+//!   `Signal`s to the TLS stream.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use crate::auth::{self, Dir, Key, ReplayWindow};
+use crate::auth::{Dir, Key};
 use crate::candidate::Candidate;
 use crate::protocol::{
-    self, ErrorCode, LobbyId, MAX_STATS, Message, Packet, ReportedState, Role, StatsEntry,
+    self, ErrorCode, FrameDecoder, LobbyId, MAX_STATS, Message, Packet, ReportedState, Role,
+    StatsEntry,
 };
 use crate::session::{Action, Link, SessionMachine, State};
 use crate::stats::SessionStats;
@@ -32,8 +35,8 @@ pub enum Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Registered (or re-registered) with the rendezvous server. Hosts get
-    /// their lobby ID here.
+    /// The server has seen our game socket's public endpoint (again, if it
+    /// changed). Hosts get their lobby ID here.
     Registered {
         observed: SocketAddr,
         lobby: Option<LobbyId>,
@@ -44,52 +47,62 @@ pub enum Event {
     Data { session: SessionId, data: Vec<u8> },
     /// The rendezvous server rejected a request.
     ServerError(ErrorCode),
+    /// The signalling connection ended. Established sessions keep running.
+    ServerLost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
-    Transmit { to: SocketAddr, bytes: Vec<u8> },
+    /// A UDP datagram to send from the game socket.
+    Transmit {
+        to: SocketAddr,
+        bytes: Vec<u8>,
+    },
+    /// Bytes to write to the TLS signalling stream.
+    Signal(Vec<u8>),
     Event(Event),
 }
 
 #[derive(Debug)]
-enum Registration {
-    Pending {
-        nonce: u64,
-        next_send: Instant,
-    },
-    Active {
+enum Signalling {
+    /// REGISTER sent; waiting for REGISTERED.
+    Registering,
+    Registered {
         client_id: u64,
         secret: Key,
-        nonce: u64,
-        replay: ReplayWindow,
-        observed: SocketAddr,
         lobby: Option<LobbyId>,
-        next_refresh: Instant,
-        refresh_interval: Duration,
+        bind_seq: u32,
+        bind_interval: Duration,
+        next_bind: Instant,
+        /// Our public game endpoint, once a BIND has been confirmed.
+        observed: Option<SocketAddr>,
     },
-    Closed,
+    Lost,
 }
 
 #[derive(Debug)]
 pub struct Agent {
     cfg: Config,
+    /// The server's UDP endpoint, for BIND.
     server: SocketAddr,
-    local: Vec<Candidate>,
     mode: Mode,
-    reg: Registration,
-    server_seq: u32,
+    signalling: Signalling,
+    decoder: FrameDecoder,
     sessions: HashMap<SessionId, SessionMachine>,
     /// The joiner's session before the server has introduced us.
     pending: Option<SessionMachine>,
-    next_join: Instant,
+    next_heartbeat: Instant,
+    heartbeat_id: u32,
     next_stats: Instant,
     last_tick: Instant,
     out: VecDeque<Output>,
 }
 
 impl Agent {
-    /// `local` are our host candidates (see [`crate::candidate::gather_host`]).
+    /// `server` is the rendezvous server's address (UDP and TCP share the
+    /// port); `local` are our host candidates (see
+    /// [`crate::candidate::gather_host`]). The REGISTER frame is queued
+    /// immediately.
     pub fn new(
         cfg: Config,
         server: SocketAddr,
@@ -101,27 +114,35 @@ impl Agent {
             Mode::Host => None,
             Mode::Join(_) => Some(SessionMachine::new(cfg).start()),
         };
-        Self {
+        let mut agent = Self {
             cfg,
             server,
-            local,
             mode,
-            reg: Registration::Pending {
-                nonce: auth::random_u64(),
-                next_send: now,
-            },
-            server_seq: 0,
+            signalling: Signalling::Registering,
+            decoder: FrameDecoder::default(),
             sessions: HashMap::new(),
             pending,
-            next_join: now,
+            next_heartbeat: now + cfg.heartbeat_interval,
+            heartbeat_id: 0,
             next_stats: now + cfg.stats_interval,
             last_tick: now,
             out: VecDeque::new(),
-        }
+        };
+        agent.signal(Message::Register {
+            host: mode == Mode::Host,
+            candidates: local,
+        });
+        agent
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// False once the signalling connection is gone (closed, corrupt, or
+    /// [`Agent::close`]d); the driver should then drop it.
+    pub fn signal_open(&self) -> bool {
+        !matches!(self.signalling, Signalling::Lost)
     }
 
     pub fn session_state(&self, id: SessionId) -> Option<State> {
@@ -139,62 +160,100 @@ impl Agent {
 
     /// When [`Agent::handle_timeout`] should next be called.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        let reg = match &self.reg {
-            Registration::Pending { next_send, .. } => Some(*next_send),
-            Registration::Active { next_refresh, .. } => Some(*next_refresh),
-            Registration::Closed => None,
+        let bind = match &self.signalling {
+            Signalling::Registered { next_bind, .. } => Some(*next_bind),
+            _ => None,
         };
-        let join = self.wants_join().then_some(self.next_join);
+        let heartbeat = self.signal_open().then_some(self.next_heartbeat);
         let stats = self.wants_stats().then_some(self.next_stats);
         let active = self.pending.is_some() || self.sessions.values().any(|s| !s.is_terminal());
         let tick = active.then(|| self.last_tick + self.cfg.tick_interval);
-        [reg, join, stats, tick].into_iter().flatten().min()
+        [bind, heartbeat, stats, tick].into_iter().flatten().min()
     }
 
+    /// Handles a UDP datagram received on the game socket.
     pub fn handle_packet(&mut self, from: SocketAddr, raw: &[u8], now: Instant) {
+        // The server never sends UDP; anything claiming to be from it is noise.
+        if from == self.server {
+            return;
+        }
         let Ok(packet) = Packet::decode(raw) else {
             return;
         };
-        if from == self.server {
-            self.handle_server(raw, packet, now);
-        } else if self.sessions.contains_key(&packet.id) {
+        if self.sessions.contains_key(&packet.id) {
             self.step(packet.id, |s, out| {
                 s.handle_packet(from, raw, packet, now, out)
             });
         }
     }
 
+    /// Handles decrypted bytes from the signalling stream.
+    pub fn handle_signal(&mut self, data: &[u8], now: Instant) {
+        self.decoder.push(data);
+        loop {
+            match self.decoder.next_frame() {
+                Ok(Some(msg)) => self.handle_frame(msg, now),
+                Ok(None) => return,
+                Err(_) => {
+                    self.signal_closed();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Tells the agent the signalling connection has ended.
+    pub fn signal_closed(&mut self) {
+        if self.signal_open() {
+            self.signalling = Signalling::Lost;
+            // A joiner that has not been introduced yet cannot proceed.
+            self.pending = None;
+            self.event(Event::ServerLost);
+        }
+    }
+
     pub fn handle_timeout(&mut self, now: Instant) {
         self.last_tick = now;
-        let register = match &mut self.reg {
-            Registration::Pending { nonce, next_send } if now >= *next_send => {
-                *next_send = now + self.cfg.server_retry;
-                Some((*nonce, None))
+
+        if let Signalling::Registered {
+            client_id,
+            secret,
+            bind_seq,
+            bind_interval,
+            next_bind,
+            observed,
+            ..
+        } = &mut self.signalling
+            && now >= *next_bind
+        {
+            // Retry quickly until the first BIND is confirmed, then refresh
+            // to keep the NAT mapping (and so the candidate) alive.
+            *next_bind = now
+                + if observed.is_some() {
+                    *bind_interval
+                } else {
+                    self.cfg.server_retry
+                };
+            let packet = Packet {
+                id: *client_id,
+                seq: *bind_seq,
+                msg: Message::Bind,
+            };
+            *bind_seq = bind_seq.wrapping_add(1);
+            if let Ok(bytes) = packet.encode(secret, Dir::ClientToServer) {
+                self.out.push_back(Output::Transmit {
+                    to: self.server,
+                    bytes,
+                });
             }
-            Registration::Active {
-                secret,
-                nonce,
-                next_refresh,
-                refresh_interval,
-                ..
-            } if now >= *next_refresh => {
-                *next_refresh = now + *refresh_interval;
-                Some((*nonce, Some(*secret)))
-            }
-            _ => None,
-        };
-        if let Some((nonce, secret)) = register {
-            let msg = self.register_msg(nonce);
-            self.send_server(msg, secret.as_ref());
         }
 
-        if self.wants_join() && now >= self.next_join {
-            self.next_join = now + self.cfg.server_retry;
-            if let (Mode::Join(lobby), Registration::Active { secret, .. }) = (self.mode, &self.reg)
-            {
-                let secret = *secret;
-                self.send_server(Message::Join { lobby }, Some(&secret));
-            }
+        if self.signal_open() && now >= self.next_heartbeat {
+            self.next_heartbeat = now + self.cfg.heartbeat_interval;
+            self.heartbeat_id = self.heartbeat_id.wrapping_add(1);
+            self.signal(Message::Ping {
+                id: self.heartbeat_id,
+            });
         }
 
         let ids: Vec<_> = self.sessions.keys().copied().collect();
@@ -234,117 +293,77 @@ impl Agent {
             self.close_session(id);
         }
         self.pending = None;
-        if let Registration::Active { secret, .. } = self.reg {
-            self.send_server(Message::Close { reason: 0 }, Some(&secret));
+        if self.signal_open() {
+            self.signal(Message::Close { reason: 0 });
+            self.signalling = Signalling::Lost;
         }
-        self.reg = Registration::Closed;
     }
 
-    fn handle_server(&mut self, raw: &[u8], packet: Packet, now: Instant) {
-        if let Message::Registered {
-            nonce,
-            secret,
-            observed,
-            lobby,
-            ttl_secs,
-        } = packet.msg
-        {
-            self.handle_registered(
-                raw, packet.id, packet.seq, nonce, secret, observed, lobby, ttl_secs, now,
-            );
-            return;
-        }
-
-        // Only two error codes may arrive unauthenticated, and only in
-        // response to one of our recent packets.
-        if let Message::Error { code, ref_seq } = packet.msg
-            && packet.id == 0
-        {
-            let recent = self.server_seq.wrapping_sub(ref_seq).wrapping_sub(1) < 16;
-            if recent && matches!(code, ErrorCode::BadAuth | ErrorCode::UnknownClient) {
-                self.server_error(code, now);
+    fn handle_frame(&mut self, msg: Message, now: Instant) {
+        match msg {
+            Message::Registered {
+                client_id,
+                secret,
+                lobby,
+                bind_secs,
+            } if matches!(self.signalling, Signalling::Registering) => {
+                self.signalling = Signalling::Registered {
+                    client_id,
+                    secret,
+                    lobby,
+                    bind_seq: 0,
+                    bind_interval: Duration::from_secs(u64::from(bind_secs.max(1))),
+                    next_bind: now,
+                    observed: None,
+                };
             }
-            return;
-        }
-
-        let Registration::Active {
-            client_id,
-            secret,
-            replay,
-            ..
-        } = &mut self.reg
-        else {
-            return;
-        };
-        if packet.id != *client_id
-            || !protocol::verify(raw, secret, Dir::ServerToClient)
-            || !replay.accept(packet.seq)
-        {
-            return;
-        }
-
-        match packet.msg {
+            Message::Bound { observed } => self.handle_bound(observed, now),
+            // The server measures signalling latency for its dashboard.
+            Message::Ping { id } => self.signal(Message::Pong { id }),
             Message::PeerInfo {
                 session_id,
                 role,
                 key,
                 candidates,
             } => self.handle_peer_info(session_id, role, key, candidates, now),
-            Message::Error { code, .. } => self.server_error(code, now),
+            Message::Error { code } => {
+                if matches!(code, ErrorCode::LobbyNotFound | ErrorCode::LobbyFull) {
+                    self.pending = None;
+                }
+                self.event(Event::ServerError(code));
+            }
             _ => {}
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn handle_registered(
-        &mut self,
-        raw: &[u8],
-        client_id: u64,
-        seq: u32,
-        nonce: u64,
-        secret: Key,
-        observed: SocketAddr,
-        lobby: Option<LobbyId>,
-        ttl_secs: u16,
-        now: Instant,
-    ) {
-        match &mut self.reg {
-            Registration::Pending { nonce: ours, .. }
-                if *ours == nonce && protocol::verify(raw, &secret, Dir::ServerToClient) =>
-            {
-                let mut replay = ReplayWindow::default();
-                replay.accept(seq);
-                let refresh_interval = Duration::from_secs(u64::from(ttl_secs.max(4)) / 4);
-                self.reg = Registration::Active {
-                    client_id,
-                    secret,
-                    nonce,
-                    replay,
-                    observed,
-                    lobby,
-                    next_refresh: now + refresh_interval,
-                    refresh_interval,
-                };
-                self.next_join = now;
-                self.event(Event::Registered { observed, lobby });
-            }
-            Registration::Active {
-                client_id: id,
-                secret: ours,
-                replay,
-                observed: known_observed,
-                lobby: known_lobby,
-                ..
-            } if *id == client_id && protocol::verify(raw, ours, Dir::ServerToClient) => {
-                if !replay.accept(seq) {
-                    return;
-                }
-                if (*known_observed, *known_lobby) != (observed, lobby) {
-                    (*known_observed, *known_lobby) = (observed, lobby);
-                    self.event(Event::Registered { observed, lobby });
-                }
-            }
-            _ => {}
+    fn handle_bound(&mut self, new: SocketAddr, now: Instant) {
+        let Signalling::Registered {
+            lobby,
+            observed,
+            bind_interval,
+            next_bind,
+            ..
+        } = &mut self.signalling
+        else {
+            return;
+        };
+        let first = observed.is_none();
+        if *observed == Some(new) {
+            return;
+        }
+        if first {
+            // Confirmed: switch from retrying to refreshing.
+            *next_bind = now + *bind_interval;
+        }
+        *observed = Some(new);
+        let lobby = *lobby;
+        self.event(Event::Registered {
+            observed: new,
+            lobby,
+        });
+        // The server introduces only bound clients, so join once bound.
+        if first && let (Mode::Join(lobby), Some(_)) = (self.mode, &self.pending) {
+            self.signal(Message::Join { lobby });
         }
     }
 
@@ -372,44 +391,14 @@ impl Agent {
         self.step(session_id, |s, out| s.peer_info(link, candidates, now, out));
     }
 
-    fn server_error(&mut self, code: ErrorCode, now: Instant) {
-        match code {
-            // The server forgot us (e.g. it restarted): register again.
-            ErrorCode::BadAuth | ErrorCode::UnknownClient => {
-                self.reg = Registration::Pending {
-                    nonce: auth::random_u64(),
-                    next_send: now,
-                };
-            }
-            ErrorCode::LobbyNotFound | ErrorCode::LobbyFull => self.pending = None,
-            ErrorCode::Unknown(_) => {}
-        }
-        self.event(Event::ServerError(code));
-    }
-
-    /// A joiner keeps sending JOIN until it is introduced and has heard from
-    /// the host, since the host's PEER_INFO may have been lost.
-    fn wants_join(&self) -> bool {
-        matches!(self.mode, Mode::Join(_))
-            && matches!(self.reg, Registration::Active { .. })
-            && (self.pending.is_some()
-                || self
-                    .sessions
-                    .values()
-                    .any(|s| s.state() == State::Connecting && !s.heard_from_peer()))
-    }
-
     /// Hosts report their sessions' path quality to the server.
     fn wants_stats(&self) -> bool {
         self.mode == Mode::Host
-            && matches!(self.reg, Registration::Active { .. })
+            && matches!(self.signalling, Signalling::Registered { .. })
             && !self.sessions.is_empty()
     }
 
     fn report_stats(&mut self, now: Instant) {
-        let Registration::Active { secret, .. } = self.reg else {
-            return;
-        };
         let micros = |d: Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX - 1);
         let entries: Vec<_> = self
             .sessions
@@ -433,33 +422,12 @@ impl Agent {
             })
             .take(MAX_STATS)
             .collect();
-        self.send_server(Message::Stats(entries), Some(&secret));
+        self.signal(Message::Stats(entries));
     }
 
-    fn register_msg(&self, nonce: u64) -> Message {
-        Message::Register {
-            nonce,
-            host: self.mode == Mode::Host,
-            candidates: self.local.clone(),
-        }
-    }
-
-    fn send_server(&mut self, msg: Message, secret: Option<&Key>) {
-        let client_id = match self.reg {
-            Registration::Active { client_id, .. } if secret.is_some() => client_id,
-            _ => 0,
-        };
-        let packet = Packet {
-            id: client_id,
-            seq: self.server_seq,
-            msg,
-        };
-        self.server_seq = self.server_seq.wrapping_add(1);
-        if let Ok(bytes) = packet.encode(secret.map(|k| (k, Dir::ClientToServer))) {
-            self.out.push_back(Output::Transmit {
-                to: self.server,
-                bytes,
-            });
+    fn signal(&mut self, msg: Message) {
+        if let Ok(bytes) = protocol::encode_frame(&msg) {
+            self.out.push_back(Output::Signal(bytes));
         }
     }
 
@@ -511,160 +479,191 @@ mod tests {
         "192.0.2.1:7777".parse().unwrap()
     }
 
-    /// A scripted rendezvous server: decodes what the agent sends and seals replies.
-    struct FakeServer {
-        seq: u32,
+    fn observed() -> SocketAddr {
+        "203.0.113.9:40001".parse().unwrap()
     }
 
-    impl FakeServer {
-        fn reply(&mut self, msg: Message) -> Vec<u8> {
-            self.seq += 1;
-            Packet {
-                id: CLIENT,
-                seq: self.seq,
-                msg,
-            }
-            .encode(Some((&SECRET, Dir::ServerToClient)))
-            .unwrap()
-        }
+    #[derive(Default)]
+    struct Drained {
+        signals: Vec<Message>,
+        to_server: Vec<Packet>,
+        to_peers: Vec<Packet>,
+        events: Vec<Event>,
     }
 
-    fn drain(agent: &mut Agent) -> (Vec<Packet>, Vec<Event>) {
-        let (mut sent, mut events) = (Vec::new(), Vec::new());
+    fn drain(agent: &mut Agent) -> Drained {
+        let mut d = Drained::default();
+        let mut frames = FrameDecoder::default();
         while let Some(o) = agent.poll_output() {
             match o {
-                Output::Transmit { to, bytes } if to == server() => {
-                    sent.push(Packet::decode(&bytes).unwrap())
+                Output::Signal(bytes) => {
+                    frames.push(&bytes);
+                    d.signals.push(frames.next_frame().unwrap().unwrap());
                 }
-                Output::Transmit { .. } => {}
-                Output::Event(e) => events.push(e),
+                Output::Transmit { to, bytes } if to == server() => {
+                    assert!(
+                        protocol::verify(&bytes, &SECRET, Dir::ClientToServer),
+                        "BIND MAC"
+                    );
+                    d.to_server.push(Packet::decode(&bytes).unwrap());
+                }
+                Output::Transmit { bytes, .. } => d.to_peers.push(Packet::decode(&bytes).unwrap()),
+                Output::Event(e) => d.events.push(e),
             }
         }
-        (sent, events)
+        d
     }
 
-    /// Runs the registration handshake and returns the resulting events.
-    fn register(
-        agent: &mut Agent,
-        srv: &mut FakeServer,
-        lobby: Option<LobbyId>,
-        now: Instant,
-    ) -> Vec<Event> {
-        agent.handle_timeout(now);
-        let (sent, _) = drain(agent);
-        let Message::Register { nonce, .. } = sent[0].msg else {
-            panic!("expected REGISTER, got {:?}", sent[0]);
-        };
-        let reply = srv.reply(Message::Registered {
-            nonce,
-            secret: SECRET,
-            observed: "203.0.113.9:40001".parse().unwrap(),
-            lobby,
-            ttl_secs: 60,
-        });
-        agent.handle_packet(server(), &reply, now);
-        drain(agent).1
+    fn feed(agent: &mut Agent, msg: Message, now: Instant) {
+        agent.handle_signal(&protocol::encode_frame(&msg).unwrap(), now);
     }
 
-    #[test]
-    fn host_registers_and_accepts_a_joiner() {
-        let now = Instant::now();
-        let local = vec![Candidate::host("10.0.0.2:5000".parse().unwrap())];
-        let mut agent = Agent::new(Config::default(), server(), local, Mode::Host, now);
-        let mut srv = FakeServer { seq: 0 };
-
-        agent.handle_timeout(now);
-        let (sent, _) = drain(&mut agent);
+    /// REGISTER → REGISTERED → BIND → BOUND. Returns what followed BOUND.
+    fn register(agent: &mut Agent, lobby: Option<LobbyId>, now: Instant) -> Drained {
+        let d = drain(agent);
         assert!(
-            matches!(&sent[0], Packet { id: 0, msg: Message::Register { host: true, candidates, .. }, .. } if candidates.len() == 1)
+            matches!(d.signals[..], [Message::Register { .. }]),
+            "{:?}",
+            d.signals
         );
+        feed(
+            agent,
+            Message::Registered {
+                client_id: CLIENT,
+                secret: SECRET,
+                lobby,
+                bind_secs: 15,
+            },
+            now,
+        );
+        agent.handle_timeout(now);
+        let d = drain(agent);
+        assert!(matches!(
+            d.to_server[..],
+            [Packet {
+                id: CLIENT,
+                msg: Message::Bind,
+                ..
+            }]
+        ));
+        feed(
+            agent,
+            Message::Bound {
+                observed: observed(),
+            },
+            now,
+        );
+        drain(agent)
+    }
 
-        // A reply with the wrong nonce is ignored.
-        let forged = srv.reply(Message::Registered {
-            nonce: 1,
-            secret: SECRET,
-            observed: "203.0.113.9:40001".parse().unwrap(),
-            lobby: None,
-            ttl_secs: 60,
-        });
-        agent.handle_packet(server(), &forged, now);
-        assert!(drain(&mut agent).1.is_empty());
-
-        let lobby: LobbyId = "K7M2QX".parse().unwrap();
-        // The retry carries the same nonce.
-        let now = now + Config::default().server_retry;
-        let events = register(&mut agent, &mut srv, Some(lobby), now);
-        assert!(matches!(events[..], [Event::Registered { lobby: Some(l), .. }] if l == lobby));
-
-        let peer_info = srv.reply(Message::PeerInfo {
-            session_id: 5,
-            role: Role::Controlling,
+    fn peer_info(session_id: u64, role: Role) -> Message {
+        Message::PeerInfo {
+            session_id,
+            role,
             key: [1; 16],
             candidates: vec![Candidate {
                 kind: CandidateKind::ServerReflexive,
                 addr: "198.51.100.7:6000".parse().unwrap(),
             }],
-        });
-        agent.handle_packet(server(), &peer_info, now);
-        let mut checks = 0;
-        let mut events = Vec::new();
-        while let Some(o) = agent.poll_output() {
-            match o {
-                Output::Transmit { bytes, .. } => {
-                    checks += usize::from(matches!(
-                        Packet::decode(&bytes).unwrap().msg,
-                        Message::Check { .. }
-                    ))
-                }
-                Output::Event(e) => events.push(e),
-            }
         }
-        assert_eq!(checks, 1, "should probe the joiner's candidate immediately");
+    }
+
+    #[test]
+    fn host_registers_binds_and_accepts_a_joiner() {
+        let now = Instant::now();
+        let local = vec![Candidate::host("10.0.0.2:5000".parse().unwrap())];
+        let mut agent = Agent::new(Config::default(), server(), local, Mode::Host, now);
+
+        let lobby: LobbyId = "K7M2QX".parse().unwrap();
+        let d = register(&mut agent, Some(lobby), now);
         assert_eq!(
-            events,
+            d.events,
+            [Event::Registered {
+                observed: observed(),
+                lobby: Some(lobby)
+            }]
+        );
+
+        // After confirmation BIND is refreshed at the bind interval.
+        agent.handle_timeout(now + Duration::from_secs(1));
+        assert!(
+            drain(&mut agent).to_server.is_empty(),
+            "refreshed too early"
+        );
+        agent.handle_timeout(now + Duration::from_secs(15));
+        assert_eq!(drain(&mut agent).to_server.len(), 1);
+
+        feed(&mut agent, peer_info(5, Role::Controlling), now);
+        let d = drain(&mut agent);
+        assert_eq!(
+            d.events,
             [Event::Session {
                 id: 5,
                 state: State::Connecting
             }]
         );
+        assert!(matches!(
+            d.to_peers[..],
+            [Packet {
+                id: 5,
+                msg: Message::Check { .. },
+                ..
+            }]
+        ));
 
-        // A duplicate PEER_INFO (retried JOIN) is ignored.
-        agent.handle_packet(server(), &peer_info, now);
-        assert_eq!(drain(&mut agent), (vec![], vec![]));
+        // A duplicate PEER_INFO is ignored.
+        feed(&mut agent, peer_info(5, Role::Controlling), now);
+        let d = drain(&mut agent);
+        assert!(d.events.is_empty() && d.to_peers.is_empty());
     }
 
     #[test]
-    fn host_reports_stats() {
+    fn joiner_joins_once_bound_and_stops_on_lobby_not_found() {
         let now = Instant::now();
-        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Host, now);
-        let mut srv = FakeServer { seq: 0 };
-        register(&mut agent, &mut srv, None, now);
+        let lobby: LobbyId = "ZZZZZZ".parse().unwrap();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Join(lobby), now);
+        let d = register(&mut agent, None, now);
+        assert!(matches!(d.signals[..], [Message::Join { lobby: l }] if l == lobby));
 
-        // Nothing to report without sessions.
-        let later = now + Config::default().stats_interval;
-        agent.handle_timeout(later);
-        assert!(
-            !drain(&mut agent)
-                .0
-                .iter()
-                .any(|p| matches!(p.msg, Message::Stats(_)))
+        feed(
+            &mut agent,
+            Message::Error {
+                code: ErrorCode::LobbyNotFound,
+            },
+            now,
+        );
+        assert_eq!(
+            drain(&mut agent).events,
+            [Event::ServerError(ErrorCode::LobbyNotFound)]
         );
 
-        let peer_info = srv.reply(Message::PeerInfo {
-            session_id: 5,
-            role: Role::Controlling,
-            key: [1; 16],
-            candidates: vec![Candidate::host("198.51.100.7:6000".parse().unwrap())],
-        });
-        agent.handle_packet(server(), &peer_info, later);
+        // A rebinding (new public endpoint) does not trigger another JOIN.
+        feed(
+            &mut agent,
+            Message::Bound {
+                observed: "203.0.113.9:40002".parse().unwrap(),
+            },
+            now,
+        );
+        assert!(drain(&mut agent).signals.is_empty());
+    }
+
+    #[test]
+    fn heartbeats_and_stats_go_over_signalling() {
+        let now = Instant::now();
+        // Report before the session's connectivity checks time out.
+        let cfg = Config {
+            stats_interval: Duration::from_secs(1),
+            ..Config::default()
+        };
+        let mut agent = Agent::new(cfg, server(), vec![], Mode::Host, now);
+        register(&mut agent, None, now);
+        feed(&mut agent, peer_info(5, Role::Controlling), now);
         drain(&mut agent);
 
-        // The report is already due; go well before the session's checks time out.
-        let report_at = later + Duration::from_secs(1);
-        agent.handle_timeout(report_at);
-        let (sent, _) = drain(&mut agent);
-        let stats = sent.iter().find_map(|p| match &p.msg {
-            Message::Stats(e) => Some(e.clone()),
+        agent.handle_timeout(now + cfg.stats_interval);
+        let stats = drain(&mut agent).signals.into_iter().find_map(|m| match m {
+            Message::Stats(e) => Some(e),
             _ => None,
         });
         assert_eq!(
@@ -678,84 +677,53 @@ mod tests {
                 loss_permille: 0,
             }])
         );
-        assert_eq!(
-            agent.stats(5, report_at).map(|s| s.state),
-            Some(State::Connecting)
+
+        agent.handle_timeout(now + cfg.heartbeat_interval);
+        assert!(
+            drain(&mut agent)
+                .signals
+                .iter()
+                .any(|m| matches!(m, Message::Ping { .. }))
         );
+
+        // The server's own pings are answered.
+        feed(&mut agent, Message::Ping { id: 9 }, now);
+        assert_eq!(drain(&mut agent).signals, [Message::Pong { id: 9 }]);
     }
 
     #[test]
-    fn joiner_joins_and_stops_on_lobby_not_found() {
-        let now = Instant::now();
-        let lobby: LobbyId = "ZZZZZZ".parse().unwrap();
-        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Join(lobby), now);
-        let mut srv = FakeServer { seq: 0 };
-        register(&mut agent, &mut srv, None, now);
-
-        agent.handle_timeout(now);
-        let (sent, _) = drain(&mut agent);
-        assert!(
-            matches!(sent[..], [Packet { id: CLIENT, msg: Message::Join { lobby: l }, seq, .. }] if l == lobby && seq == 1)
-        );
-
-        let err = srv.reply(Message::Error {
-            code: ErrorCode::LobbyNotFound,
-            ref_seq: 1,
-        });
-        agent.handle_packet(server(), &err, now);
-        assert_eq!(
-            drain(&mut agent).1,
-            [Event::ServerError(ErrorCode::LobbyNotFound)]
-        );
-
-        agent.handle_timeout(now + Duration::from_secs(1));
-        let (sent, _) = drain(&mut agent);
-        assert!(
-            !sent.iter().any(|p| matches!(p.msg, Message::Join { .. })),
-            "kept joining"
-        );
-    }
-
-    #[test]
-    fn re_registers_when_the_server_forgets_us() {
+    fn losing_signalling_keeps_sessions() {
         let now = Instant::now();
         let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Host, now);
-        let mut srv = FakeServer { seq: 0 };
-        register(&mut agent, &mut srv, None, now);
+        register(&mut agent, None, now);
+        feed(&mut agent, peer_info(5, Role::Controlling), now);
+        drain(&mut agent);
 
-        // Unauthenticated errors must reference one of our recent packets.
-        let unauth = |ref_seq| {
-            Packet {
-                id: 0,
-                seq: 0,
-                msg: Message::Error {
-                    code: ErrorCode::UnknownClient,
-                    ref_seq,
-                },
-            }
-            .encode(None)
-            .unwrap()
-        };
-        agent.handle_packet(server(), &unauth(1000), now);
-        assert!(
-            drain(&mut agent).1.is_empty(),
-            "accepted an error for a packet we never sent"
-        );
+        agent.signal_closed();
+        assert!(!agent.signal_open());
+        assert_eq!(drain(&mut agent).events, [Event::ServerLost]);
+        assert_eq!(agent.session_state(5), Some(State::Connecting));
 
-        agent.handle_packet(server(), &unauth(0), now);
-        assert_eq!(
-            drain(&mut agent).1,
-            [Event::ServerError(ErrorCode::UnknownClient)]
-        );
-        agent.handle_timeout(now);
-        let (sent, _) = drain(&mut agent);
-        assert!(matches!(
-            sent[..],
-            [Packet {
-                id: 0,
-                msg: Message::Register { .. },
-                ..
-            }]
-        ));
+        // A corrupt stream counts as lost too.
+        let mut other = Agent::new(Config::default(), server(), vec![], Mode::Host, now);
+        drain(&mut other);
+        other.handle_signal(&[0xff, 0xff, 0xff], now);
+        assert!(!other.signal_open());
+    }
+
+    #[test]
+    fn ignores_udp_claiming_to_be_from_the_server() {
+        let now = Instant::now();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Host, now);
+        register(&mut agent, None, now);
+        let forged = Packet {
+            id: CLIENT,
+            seq: 0,
+            msg: Message::Data(vec![1]),
+        }
+        .encode(&SECRET, Dir::ServerToClient)
+        .unwrap();
+        agent.handle_packet(server(), &forged, now);
+        assert!(drain(&mut agent).events.is_empty());
     }
 }

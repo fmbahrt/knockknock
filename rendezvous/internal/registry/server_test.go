@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"io"
 	"log/slog"
 	"net"
@@ -10,125 +12,138 @@ import (
 	"time"
 
 	"knockknock/rendezvous/internal/auth"
+	"knockknock/rendezvous/internal/devcert"
 	"knockknock/rendezvous/internal/protocol"
 )
 
-func startServer(t *testing.T, cfg Config) netip.AddrPort {
-	t.Helper()
-	_, addr := startServerWith(t, cfg)
-	return addr
+type testServer struct {
+	srv   *Server
+	addr  netip.AddrPort // same port for TCP and UDP
+	roots *x509.CertPool
 }
 
-func startServerWith(t *testing.T, cfg Config) (*Server, netip.AddrPort) {
+func startServer(t *testing.T, cfg Config) *testServer {
 	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	cert, caPEM, err := devcert.Generate([]string{"127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(udp, &tls.Config{Certificates: []tls.Certificate{cert}}, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	srv := New(conn, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go func() { done <- srv.Serve(ctx) }()
+	go func() { done <- srv.Serve(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return srv, conn.LocalAddr().(*net.UDPAddr).AddrPort()
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(caPEM)
+	return &testServer{srv, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)), roots}
 }
 
-// testClient is a minimal protocol client for driving the server.
+// testClient is a minimal protocol client: a TLS signalling connection plus a
+// UDP "game" socket for BIND.
 type testClient struct {
 	t      *testing.T
-	conn   *net.UDPConn
-	server netip.AddrPort
+	ts     *testServer
+	conn   *tls.Conn
+	udp    *net.UDPConn
 	id     uint64
 	secret auth.Key
 	seq    uint32
 }
 
-func newClient(t *testing.T, server netip.AddrPort) *testClient {
+func newClient(t *testing.T, ts *testServer) *testClient {
 	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	conn, err := tls.Dial("tcp", ts.addr.String(), &tls.Config{RootCAs: ts.roots})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
-	return &testClient{t: t, conn: conn, server: server}
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(); udp.Close() })
+	return &testClient{t: t, ts: ts, conn: conn, udp: udp}
 }
 
-func (c *testClient) addr() netip.AddrPort { return c.conn.LocalAddr().(*net.UDPAddr).AddrPort() }
+func (c *testClient) gameAddr() netip.AddrPort { return c.udp.LocalAddr().(*net.UDPAddr).AddrPort() }
 
-func (c *testClient) sendRaw(b []byte) {
+func (c *testClient) send(m protocol.Message) {
 	c.t.Helper()
-	if _, err := c.conn.WriteToUDPAddrPort(b, c.server); err != nil {
-		c.t.Fatal(err)
-	}
-}
-
-// send seals m with the client's secret (or sends it unauthenticated before
-// registration) and returns the raw packet.
-func (c *testClient) send(m protocol.Message) []byte {
-	c.t.Helper()
-	var key *auth.Key
-	if c.id != 0 {
-		key = &c.secret
-	}
-	b, err := protocol.Seal(nil, protocol.Packet{ID: c.id, Seq: c.seq, Msg: m}, key, auth.ClientToServer)
+	b, err := protocol.AppendFrame(nil, m)
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	c.seq++
-	c.sendRaw(b)
-	return b
+	if _, err := c.conn.Write(b); err != nil {
+		c.t.Fatal(err)
+	}
 }
 
-// recv returns the next message, checking its MAC when it is addressed to us.
+func (c *testClient) tryRecv(timeout time.Duration) (protocol.Message, error) {
+	c.conn.SetReadDeadline(time.Now().Add(timeout))
+	return protocol.ReadFrame(c.conn)
+}
+
 func (c *testClient) recv() protocol.Message {
 	c.t.Helper()
-	m, ok := c.tryRecv(2 * time.Second)
-	if !ok {
-		c.t.Fatal("timed out waiting for a message")
+	m, err := c.tryRecv(2 * time.Second)
+	if err != nil {
+		c.t.Fatalf("recv: %v", err)
 	}
 	return m
 }
 
-func (c *testClient) tryRecv(timeout time.Duration) (protocol.Message, bool) {
+// bindPacket returns an authenticated BIND with the next sequence number.
+func (c *testClient) bindPacket(key auth.Key) []byte {
 	c.t.Helper()
-	buf := make([]byte, 1500)
-	c.conn.SetReadDeadline(time.Now().Add(timeout))
-	n, _, err := c.conn.ReadFromUDPAddrPort(buf)
-	if err != nil {
-		return nil, false
-	}
-	p, err := protocol.Decode(buf[:n])
+	b, err := protocol.Seal(nil, protocol.Packet{ID: c.id, Seq: c.seq, Msg: &protocol.Bind{}}, key, auth.ClientToServer)
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	if r, ok := p.Msg.(*protocol.Registered); ok && c.id == 0 {
-		c.id, c.secret = p.ID, r.Secret
+	c.seq++
+	return b
+}
+
+func (c *testClient) sendUDP(b []byte) {
+	c.t.Helper()
+	if _, err := c.udp.WriteToUDPAddrPort(b, c.ts.addr); err != nil {
+		c.t.Fatal(err)
 	}
-	if p.ID != 0 && !protocol.Verify(buf[:n], c.secret, auth.ServerToClient) {
-		c.t.Fatalf("bad MAC on %T", p.Msg)
-	}
-	return p.Msg, true
 }
 
 func (c *testClient) register(host bool) *protocol.Registered {
 	c.t.Helper()
-	c.send(&protocol.Register{Nonce: 42, Host: host, Candidates: []protocol.Candidate{
+	c.send(&protocol.Register{Host: host, Candidates: []protocol.Candidate{
 		{Kind: protocol.KindHost, Addr: netip.MustParseAddrPort("10.0.0.9:1234")},
 	}})
-	return c.recv().(*protocol.Registered)
+	r := c.recv().(*protocol.Registered)
+	c.id, c.secret = r.ClientID, r.Secret
+	c.sendUDP(c.bindPacket(c.secret))
+	if b := c.recv().(*protocol.Bound); b.Observed != c.gameAddr() {
+		c.t.Fatalf("bound to %v, want %v", b.Observed, c.gameAddr())
+	}
+	return r
 }
 
 func TestHostAndJoin(t *testing.T) {
-	srv := startServer(t, DefaultConfig())
-	host, joiner := newClient(t, srv), newClient(t, srv)
+	ts := startServer(t, DefaultConfig())
+	host, joiner := newClient(t, ts), newClient(t, ts)
 
 	hr := host.register(true)
-	if hr.Lobby.IsZero() || hr.Observed != host.addr() || hr.Nonce != 42 {
+	if hr.Lobby.IsZero() || hr.BindSecs != 15 {
 		t.Fatalf("host registered: %+v", hr)
 	}
 	if jr := joiner.register(false); !jr.Lobby.IsZero() {
@@ -145,41 +160,56 @@ func TestHostAndJoin(t *testing.T) {
 	if toHost.Role != protocol.RoleControlling || toJoiner.Role != protocol.RoleControlled {
 		t.Errorf("roles: host %d, joiner %d", toHost.Role, toJoiner.Role)
 	}
-	wantHost := []protocol.Candidate{
-		{Kind: protocol.KindServerReflexive, Addr: host.addr()},
+	want := []protocol.Candidate{
+		{Kind: protocol.KindServerReflexive, Addr: host.gameAddr()},
 		{Kind: protocol.KindHost, Addr: netip.MustParseAddrPort("10.0.0.9:1234")},
 	}
-	if len(toJoiner.Candidates) != 2 || toJoiner.Candidates[0] != wantHost[0] || toJoiner.Candidates[1] != wantHost[1] {
+	if len(toJoiner.Candidates) != 2 || toJoiner.Candidates[0] != want[0] || toJoiner.Candidates[1] != want[1] {
 		t.Errorf("joiner got host candidates %+v", toJoiner.Candidates)
 	}
-	if toHost.Candidates[0].Addr != joiner.addr() {
+	if toHost.Candidates[0].Addr != joiner.gameAddr() {
 		t.Errorf("host got joiner candidates %+v", toHost.Candidates)
-	}
-
-	// A retried JOIN re-sends the same session rather than creating another.
-	joiner.send(&protocol.Join{Lobby: hr.Lobby})
-	if again := joiner.recv().(*protocol.PeerInfo); again.SessionID != toJoiner.SessionID {
-		t.Errorf("retried join created session %x, want %x", again.SessionID, toJoiner.SessionID)
 	}
 }
 
-func TestRegisterRetryIsIdempotent(t *testing.T) {
-	srv := startServer(t, DefaultConfig())
-	c := newClient(t, srv)
-	first := c.register(true)
-	id := c.id
-	c.id, c.seq = 0, 0 // pretend the reply was lost and retry
-	second := c.register(true)
-	if c.id != id || second.Lobby != first.Lobby || second.Secret != first.Secret {
-		t.Errorf("retry created a new registration")
+func TestBindIsAuthenticated(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	c := newClient(t, ts)
+	c.send(&protocol.Register{})
+	r := c.recv().(*protocol.Registered)
+	c.id, c.secret = r.ClientID, r.Secret
+
+	c.sendUDP(c.bindPacket(auth.Key{1})) // wrong key
+	if m, err := c.tryRecv(200 * time.Millisecond); err == nil {
+		t.Fatalf("forged BIND answered with %T", m)
+	}
+
+	good := c.bindPacket(c.secret)
+	c.sendUDP(good)
+	if _, ok := c.recv().(*protocol.Bound); !ok {
+		t.Fatal("valid BIND not confirmed")
+	}
+
+	// A replay from another address must not move the binding.
+	other := newClient(t, ts)
+	other.sendUDP(good)
+	if m, err := c.tryRecv(200 * time.Millisecond); err == nil {
+		t.Fatalf("replayed BIND answered with %T", m)
+	}
+
+	// A fresh BIND from a new address (NAT rebinding) does.
+	c.udp = other.udp
+	c.sendUDP(c.bindPacket(c.secret))
+	if b := c.recv().(*protocol.Bound); b.Observed != other.gameAddr() {
+		t.Errorf("rebound to %v, want %v", b.Observed, other.gameAddr())
 	}
 }
 
 func TestJoinErrors(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxLobby = 2
-	srv := startServer(t, cfg)
-	host, a, b := newClient(t, srv), newClient(t, srv), newClient(t, srv)
+	ts := startServer(t, cfg)
+	host, a, b := newClient(t, ts), newClient(t, ts), newClient(t, ts)
 	lobby := host.register(true).Lobby
 	a.register(false)
 	b.register(false)
@@ -204,65 +234,75 @@ func TestJoinErrors(t *testing.T) {
 	}
 }
 
-func TestAuthentication(t *testing.T) {
-	srv := startServer(t, DefaultConfig())
-	c := newClient(t, srv)
-	lobby := c.register(true).Lobby
-
-	// Unknown client.
-	b, _ := protocol.Seal(nil, protocol.Packet{ID: 99, Seq: 7, Msg: &protocol.Join{Lobby: lobby}}, &c.secret, auth.ClientToServer)
-	c.sendRaw(b)
-	if e := c.recv().(*protocol.Error); e.Code != protocol.ErrUnknownClient || e.RefSeq != 7 {
-		t.Errorf("unknown client: %+v", e)
-	}
-
-	// Wrong key.
-	wrong := auth.Key{1}
-	b, _ = protocol.Seal(nil, protocol.Packet{ID: c.id, Seq: 8, Msg: &protocol.Join{Lobby: lobby}}, &wrong, auth.ClientToServer)
-	c.sendRaw(b)
-	if e := c.recv().(*protocol.Error); e.Code != protocol.ErrBadAuth {
-		t.Errorf("bad auth: %+v", e)
-	}
-
-	// Replay: the same authenticated refresh twice gets one answer.
-	refresh := c.send(&protocol.Register{Nonce: 1})
-	c.recv()
-	c.sendRaw(refresh)
-	if m, ok := c.tryRecv(200 * time.Millisecond); ok {
-		t.Errorf("replayed packet answered with %T", m)
+func TestJoinBeforeBindIsRejected(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	host, joiner := newClient(t, ts), newClient(t, ts)
+	lobby := host.register(true).Lobby
+	joiner.send(&protocol.Register{})
+	joiner.recv()
+	joiner.send(&protocol.Join{Lobby: lobby})
+	if e := joiner.recv().(*protocol.Error); e.Code != protocol.ErrBadRequest {
+		t.Errorf("unbound join: code %d", e.Code)
 	}
 }
 
-func TestCloseRemovesLobby(t *testing.T) {
-	srv := startServer(t, DefaultConfig())
-	host, joiner := newClient(t, srv), newClient(t, srv)
+func TestFirstFrameMustBeRegister(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	c := newClient(t, ts)
+	c.send(&protocol.Ping{ID: 1})
+	if e := c.recv().(*protocol.Error); e.Code != protocol.ErrBadRequest {
+		t.Errorf("code %d", e.Code)
+	}
+	if _, err := c.tryRecv(time.Second); err == nil {
+		t.Error("connection left open")
+	}
+}
+
+func TestHeartbeat(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	c := newClient(t, ts)
+	c.register(false)
+	c.send(&protocol.Ping{ID: 42})
+	if p := c.recv().(*protocol.Pong); p.ID != 42 {
+		t.Errorf("pong id %d", p.ID)
+	}
+}
+
+func TestDisconnectClosesLobby(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	host, joiner := newClient(t, ts), newClient(t, ts)
 	lobby := host.register(true).Lobby
 	joiner.register(false)
 
-	host.send(&protocol.Close{})
+	host.conn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(ts.srv.Snapshot().Lobbies) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	joiner.send(&protocol.Join{Lobby: lobby})
 	if e := joiner.recv().(*protocol.Error); e.Code != protocol.ErrLobbyNotFound {
 		t.Errorf("closed lobby: code %d", e.Code)
 	}
 }
 
-func TestRateLimit(t *testing.T) {
+func TestConnectionRateLimit(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Rate, cfg.Burst = 0.001, 2
-	srv := startServer(t, cfg)
+	ts := startServer(t, cfg)
 	for i := range 3 {
-		c := newClient(t, srv)
-		c.send(&protocol.Register{Nonce: uint64(i)})
-		_, ok := c.tryRecv(200 * time.Millisecond)
-		if want := i < 2; ok != want {
-			t.Errorf("registration %d answered = %v, want %v", i, ok, want)
+		conn, err := tls.Dial("tcp", ts.addr.String(), &tls.Config{RootCAs: ts.roots})
+		if want := i < 2; (err == nil) != want {
+			t.Errorf("connection %d succeeded = %v, want %v (err %v)", i, err == nil, want, err)
+		}
+		if conn != nil {
+			defer conn.Close()
 		}
 	}
 }
 
 func TestStatsReachSnapshot(t *testing.T) {
-	srv, addr := startServerWith(t, DefaultConfig())
-	host, joiner, other := newClient(t, addr), newClient(t, addr), newClient(t, addr)
+	ts := startServer(t, DefaultConfig())
+	host, joiner, other := newClient(t, ts), newClient(t, ts), newClient(t, ts)
 	lobby := host.register(true).Lobby
 	joiner.register(false)
 	other.register(true)
@@ -270,10 +310,6 @@ func TestStatsReachSnapshot(t *testing.T) {
 	joiner.send(&protocol.Join{Lobby: lobby})
 	sid := joiner.recv().(*protocol.PeerInfo).SessionID
 	host.recv()
-
-	if s := srv.Snapshot().Lobbies; len(s) != 2 || s[0].Sessions[0].State != "" {
-		t.Fatalf("before report: %+v", s)
-	}
 
 	// The other host cannot report on sessions outside its lobby.
 	other.send(&protocol.Stats{Sessions: []protocol.SessionStats{{SessionID: sid, State: protocol.StateDisconnected}}})
@@ -284,7 +320,7 @@ func TestStatsReachSnapshot(t *testing.T) {
 
 	var got SessionSnapshot
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		if got = srv.Snapshot().Lobbies[0].Sessions[0]; got.State != "" {
+		if got = ts.srv.Snapshot().Lobbies[0].Sessions[0]; got.State != "" {
 			break
 		}
 	}
@@ -292,7 +328,155 @@ func TestStatsReachSnapshot(t *testing.T) {
 		got.JitterMs != nil || got.LossPercent == nil || *got.LossPercent != 1.5 {
 		t.Errorf("snapshot session: %+v", got)
 	}
-	if m, ok := host.tryRecv(100 * time.Millisecond); ok {
-		t.Errorf("STATS was answered with %T", m)
+	if got.Joiner != joiner.gameAddr().String() {
+		t.Errorf("joiner endpoint %q", got.Joiner)
+	}
+}
+
+// eventually polls the snapshot until check passes.
+func eventually(t *testing.T, ts *testServer, what string, check func(Snapshot) bool) Snapshot {
+	t.Helper()
+	var snap Snapshot
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if snap = ts.srv.Snapshot(); check(snap) {
+			return snap
+		}
+	}
+	t.Fatalf("timed out waiting for %s; last snapshot: %+v", what, snap)
+	return snap
+}
+
+func TestUnboundAndRebindStats(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	c := newClient(t, ts)
+	c.send(&protocol.Register{})
+	r := c.recv().(*protocol.Registered)
+	c.id, c.secret = r.ClientID, r.Secret
+
+	snap := ts.srv.Snapshot()
+	if snap.Unbound != 1 || snap.ClientList[0].Bound || snap.ClientList[0].UDPAddr != "unbound" {
+		t.Fatalf("before BIND: unbound=%d %+v", snap.Unbound, snap.ClientList)
+	}
+
+	c.sendUDP(c.bindPacket(c.secret))
+	c.recv()
+	snap = ts.srv.Snapshot()
+	cs := snap.ClientList[0]
+	if snap.Unbound != 0 || !cs.Bound || cs.UDPAddr != c.gameAddr().String() || cs.Rebinds != 0 || cs.AddrMismatch {
+		t.Fatalf("after BIND: %+v", cs)
+	}
+	if cs.TLSAddr != "127.0.0.1" || cs.Role != "idle" {
+		t.Errorf("client details: %+v", cs)
+	}
+
+	// The game socket's public endpoint changes (NAT rebinding).
+	other := newClient(t, ts)
+	c.udp = other.udp
+	c.sendUDP(c.bindPacket(c.secret))
+	c.recv()
+	snap = ts.srv.Snapshot()
+	if snap.ClientList[0].Rebinds != 1 && snap.ClientList[1].Rebinds != 1 {
+		t.Errorf("rebind not counted: %+v", snap.ClientList)
+	}
+	if snap.Counters.Rebinds != 1 {
+		t.Errorf("counters.rebinds = %d", snap.Counters.Rebinds)
+	}
+}
+
+func TestCounters(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxLobby = 2
+	ts := startServer(t, cfg)
+	host, a, b := newClient(t, ts), newClient(t, ts), newClient(t, ts)
+	lobby := host.register(true).Lobby
+	a.register(false)
+	b.register(false)
+
+	missing, _ := protocol.ParseLobbyID("ZZZZZZ")
+	a.send(&protocol.Join{Lobby: missing})
+	a.recv()
+	a.send(&protocol.Join{Lobby: lobby})
+	a.recv()
+	host.recv()
+	b.send(&protocol.Join{Lobby: lobby})
+	b.recv()
+
+	// Rejected BINDs: wrong key, unknown client, replay.
+	b.sendUDP(b.bindPacket(auth.Key{9}))
+	unknown := *b
+	unknown.id = 12345
+	b.sendUDP(unknown.bindPacket(b.secret))
+	replay := b.bindPacket(b.secret)
+	b.sendUDP(replay)
+	b.sendUDP(replay)
+	// UDP and TLS are processed independently; let the BINDs land first.
+	eventually(t, ts, "bind rejections", func(s Snapshot) bool {
+		r := s.Counters.BindsRejected
+		return r[bindBadMAC]+r[bindUnknownClient]+r[bindReplay] == 3
+	})
+
+	// Disconnects: one polite, one abrupt.
+	b.send(&protocol.Close{})
+	a.conn.Close()
+
+	snap := eventually(t, ts, "disconnects", func(s Snapshot) bool {
+		return s.Counters.Disconnects[reasonLeft] == 1 && s.Counters.Disconnects[reasonClosed] == 1
+	})
+	c := snap.Counters
+	if c.Hosts != 1 || c.Players != 2 || c.Connections != 3 {
+		t.Errorf("registrations: %+v", c)
+	}
+	if c.Joins[joinOK] != 1 || c.Joins[joinNotFound] != 1 || c.Joins[joinFull] != 1 {
+		t.Errorf("joins: %v", c.Joins)
+	}
+	if c.BindsRejected[bindBadMAC] != 1 || c.BindsRejected[bindUnknownClient] != 1 || c.BindsRejected[bindReplay] != 1 {
+		t.Errorf("binds rejected: %v", c.BindsRejected)
+	}
+	if snap.Lifetimes.Clients.Count != 2 || snap.Lifetimes.Lobbies.Count != 0 {
+		t.Errorf("lifetimes: %+v", snap.Lifetimes)
+	}
+
+	host.conn.Close()
+	snap = eventually(t, ts, "lobby lifetime", func(s Snapshot) bool { return s.Lifetimes.Lobbies.Count == 1 })
+	if snap.Lifetimes.Clients.Count != 3 || snap.Lifetimes.Clients.Max <= 0 {
+		t.Errorf("lifetimes: %+v", snap.Lifetimes)
+	}
+}
+
+func TestHandshakeFailuresCounted(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	// Plain TCP, no TLS: the handshake fails.
+	conn, err := net.Dial("tcp", ts.addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Write([]byte("not tls\n"))
+	conn.Close()
+	eventually(t, ts, "handshake failure", func(s Snapshot) bool { return s.Counters.HandshakeFailures == 1 })
+}
+
+func TestServerMeasuresLatency(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PingInterval = 20 * time.Millisecond
+	ts := startServer(t, cfg)
+	c := newClient(t, ts)
+	c.register(false)
+
+	// Answer the server's pings, like a real client.
+	for range 3 {
+		ping := c.recv().(*protocol.Ping)
+		c.send(&protocol.Pong{ID: ping.ID})
+	}
+	snap := eventually(t, ts, "server rtt", func(s Snapshot) bool { return s.ClientList[0].ServerRTTMs != nil })
+	if rtt := *snap.ClientList[0].ServerRTTMs; rtt <= 0 || rtt > 1000 {
+		t.Errorf("server rtt %v ms", rtt)
+	}
+
+	// A pong for a stale ping is ignored.
+	before := *snap.ClientList[0].ServerRTTMs
+	c.send(&protocol.Pong{ID: 99999})
+	time.Sleep(50 * time.Millisecond)
+	if got := ts.srv.Snapshot().ClientList[0].ServerRTTMs; got == nil || *got <= 0 {
+		t.Errorf("rtt after stale pong: %v (before %v)", got, before)
 	}
 }

@@ -6,11 +6,10 @@
 //! Ctrl-C), so the host keeps measuring and reporting the connection.
 
 use std::env;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use knockknock::{Client, Event, LobbyId, State};
+use knockknock::{Client, Event, LobbyId, ServerTrust, State};
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -41,12 +40,8 @@ fn run(
     name: &str,
     stay: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server: SocketAddr = server
-        .to_socket_addrs()?
-        .next()
-        .ok_or("server address did not resolve")?;
     let lobby: LobbyId = lobby.parse()?;
-    let mut client = Client::join(server, lobby)?;
+    let mut client = Client::join(server, lobby, trust()?)?;
     let mut connected = false;
 
     loop {
@@ -87,6 +82,17 @@ fn run(
                 }
             }
             Event::ServerError(code) => return Err(format!("server: {code}").into()),
+            Event::ServerLost if !connected => return Err("lost the rendezvous server".into()),
+            Event::ServerLost => {}
         }
+    }
+}
+
+/// Trusts the CA in `$KNOCKKNOCK_CA` (e.g. the server's generated dev CA), or
+/// the public Web PKI roots if it is unset.
+fn trust() -> std::io::Result<ServerTrust> {
+    match std::env::var_os("KNOCKKNOCK_CA") {
+        Some(path) => ServerTrust::ca_file(path),
+        None => Ok(ServerTrust::PublicRoots),
     }
 }

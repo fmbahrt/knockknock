@@ -83,7 +83,7 @@ impl Link {
         };
         self.send_seq = self.send_seq.wrapping_add(1);
         packet
-            .encode(Some((&self.key, self.dirs().0)))
+            .encode(&self.key, self.dirs().0)
             .expect("session messages are validated before sealing")
     }
 
@@ -669,20 +669,6 @@ impl SessionMachine {
 
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Failed(_) | Self::Closed(_))
-    }
-
-    fn link(&self) -> Option<&Link> {
-        match self {
-            Self::Connecting(s) => Some(&s.state.link),
-            Self::Connected(s) => Some(&s.state.link),
-            Self::Disconnected(s) => Some(&s.state.link),
-            _ => None,
-        }
-    }
-
-    /// Whether any authenticated packet has arrived from the peer.
-    pub fn heard_from_peer(&self) -> bool {
-        self.link().is_some_and(|l| l.replay.any())
     }
 
     /// New → Gathering.

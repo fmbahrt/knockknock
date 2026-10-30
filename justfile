@@ -42,7 +42,9 @@ demo: build
     set -euo pipefail
     tmp=$(mktemp -d)
     trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$tmp"' EXIT
-    ./bin/rendezvous -addr {{ server_addr }} &
+    ./bin/rendezvous -addr {{ server_addr }} -tls-dev-ca "$tmp/ca.pem" &
+    until [ -s "$tmp/ca.pem" ]; do sleep 0.1; done
+    export KNOCKKNOCK_CA="$tmp/ca.pem"
     examples=client/target/debug/examples
     $examples/host {{ server_addr }} 2 > "$tmp/host.log" &
     host=$!
@@ -59,7 +61,9 @@ live: build
     set -euo pipefail
     tmp=$(mktemp -d)
     trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$tmp"' EXIT
-    ./bin/rendezvous -addr {{ server_addr }} -http 127.0.0.1:8080 2> "$tmp/server.log" &
+    ./bin/rendezvous -addr {{ server_addr }} -http 127.0.0.1:8080 -tls-dev-ca "$tmp/ca.pem" 2> "$tmp/server.log" &
+    until [ -s "$tmp/ca.pem" ]; do sleep 0.1; done
+    export KNOCKKNOCK_CA="$tmp/ca.pem"
     examples=client/target/debug/examples
     $examples/host {{ server_addr }} > "$tmp/host.log" &
     until lobby=$(grep -om1 'lobby [A-Z0-9]*' "$tmp/host.log"); do sleep 0.1; done

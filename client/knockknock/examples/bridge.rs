@@ -4,6 +4,8 @@
 //!     bridge <server-addr> host
 //!     bridge <server-addr> join <lobby-id>
 //!
+//! Set `KNOCKKNOCK_CA` to a CA file to trust (e.g. the server's dev CA).
+//!
 //! Output, one event per line (session IDs are 16 hex digits):
 //!
 //!     registered <observed-endpoint> <lobby-id or ->
@@ -20,13 +22,12 @@
 
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use knockknock::{Client, Event, LobbyId, SessionId, State};
+use knockknock::{Client, Event, LobbyId, ServerTrust, SessionId, State};
 
 /// How long to block on the network before checking for commands. Adds up
 /// to this much latency to sends issued over stdin.
@@ -52,13 +53,9 @@ fn main() -> ExitCode {
 }
 
 fn connect(server: &str, lobby: Option<&str>) -> Result<Client, Box<dyn std::error::Error>> {
-    let server: SocketAddr = server
-        .to_socket_addrs()?
-        .next()
-        .ok_or("server address did not resolve")?;
     Ok(match lobby {
-        None => Client::host(server)?,
-        Some(lobby) => Client::join(server, lobby.parse::<LobbyId>()?)?,
+        None => Client::host(server, trust()?)?,
+        Some(lobby) => Client::join(server, lobby.parse::<LobbyId>()?, trust()?)?,
     })
 }
 
@@ -155,6 +152,7 @@ fn print_event(
         }
         Event::Data { session, data } => writeln!(out, "data {session:016x} {}", encode_hex(data))?,
         Event::ServerError(code) => writeln!(out, "error server: {code}")?,
+        Event::ServerLost => writeln!(out, "error server connection lost")?,
     }
     Ok(())
 }
@@ -171,4 +169,13 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect()
+}
+
+/// Trusts the CA in `$KNOCKKNOCK_CA` (e.g. the server's generated dev CA), or
+/// the public Web PKI roots if it is unset.
+fn trust() -> std::io::Result<ServerTrust> {
+    match std::env::var_os("KNOCKKNOCK_CA") {
+        Some(path) => ServerTrust::ca_file(path),
+        None => Ok(ServerTrust::PublicRoots),
+    }
 }

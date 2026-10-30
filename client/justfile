@@ -1,16 +1,19 @@
 # Rust client library
 
+# Trust the dev CA written by `just rendezvous::run`, unless KNOCKKNOCK_CA is set.
+trust := if env("KNOCKKNOCK_CA", "") == "" { if path_exists("../bin/dev-ca.pem") == "true" { "KNOCKKNOCK_CA=../bin/dev-ca.pem" } else { "" } } else { "" }
+
 # Build the library and examples
 build:
     cargo build --all-targets
 
-# Open a lobby: just client::host <server-addr> [players]
+# Open a lobby: just client::host <server-addr> [players] (trusts bin/dev-ca.pem if present)
 host *args:
-    cargo run --example host -- {{ args }}
+    {{ trust }} cargo run --example host -- {{ args }}
 
 # Join a lobby: just client::join <server-addr> <lobby-id> [name]
 join *args:
-    cargo run --example join -- {{ args }}
+    {{ trust }} cargo run --example join -- {{ args }}
 
 # Run tests
 test:

@@ -1,27 +1,28 @@
 // Package protocol implements the knockknock wire format described in
-// docs/protocol.md.
+// docs/protocol.md: UDP packets with an authenticated header, and
+// length-prefixed frames on the TLS signalling connection.
 package protocol
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 
 	"knockknock/rendezvous/internal/auth"
 )
 
 const (
-	Version       byte = 2
+	Version       byte = 3
 	HeaderLen          = 32
 	MaxCandidates      = 8
 	MaxDataLen         = 1168
 	MaxStats           = 16
+	// MaxFrameLen bounds a signalling frame's type byte plus body.
+	MaxFrameLen = 4096
 	// RTTUnknown marks an RTT that has not been measured yet.
 	RTTUnknown = ^uint32(0)
-	// MinRegisterPayload is the largest possible REGISTERED payload. REGISTER
-	// is padded to at least this size so the server never amplifies.
-	MinRegisterPayload = 8 + 16 + 19 + LobbyIDLen + 2
 )
 
 var magic = [2]byte{'K', 'K'}
@@ -29,27 +30,35 @@ var magic = [2]byte{'K', 'K'}
 type Type byte
 
 const (
-	TypeRegister   Type = 0x01
-	TypeRegistered Type = 0x02
-	TypeJoin       Type = 0x03
-	TypePeerInfo   Type = 0x04
-	TypeError      Type = 0x05
-	TypeClose      Type = 0x06
-	TypeStats      Type = 0x07
-	TypeCheck      Type = 0x10
-	TypeCheckAck   Type = 0x11
-	TypePing       Type = 0x12
-	TypePong       Type = 0x13
-	TypeData       Type = 0x20
+	TypeRegister   Type = 0x01 // frame, C→S
+	TypeRegistered Type = 0x02 // frame, S→C
+	TypeJoin       Type = 0x03 // frame, C→S
+	TypePeerInfo   Type = 0x04 // frame, S→C
+	TypeError      Type = 0x05 // frame, S→C
+	TypeClose      Type = 0x06 // frame C→S (leave) and packet P↔P (end session)
+	TypeStats      Type = 0x07 // frame, C→S
+	TypeBind       Type = 0x08 // packet, C→S
+	TypeBound      Type = 0x09 // frame, S→C
+	TypeCheck      Type = 0x10 // packet, P↔P
+	TypeCheckAck   Type = 0x11 // packet, P↔P
+	TypePing       Type = 0x12 // frame (heartbeat) and packet (path RTT)
+	TypePong       Type = 0x13 // frame and packet
+	TypeData       Type = 0x20 // packet, P↔P
+)
+
+// Which message types each transport carries.
+var (
+	packetTypes = map[Type]bool{TypeBind: true, TypeClose: true, TypeCheck: true, TypeCheckAck: true, TypePing: true, TypePong: true, TypeData: true}
+	frameTypes  = map[Type]bool{TypeRegister: true, TypeRegistered: true, TypeJoin: true, TypePeerInfo: true, TypeError: true, TypeClose: true, TypeStats: true, TypeBound: true, TypePing: true, TypePong: true}
 )
 
 type ErrorCode byte
 
 const (
-	ErrBadAuth       ErrorCode = 1
-	ErrUnknownClient ErrorCode = 2
-	ErrLobbyNotFound ErrorCode = 3
-	ErrLobbyFull     ErrorCode = 4
+	ErrBadRequest    ErrorCode = 1
+	ErrLobbyNotFound ErrorCode = 2
+	ErrLobbyFull     ErrorCode = 3
+	ErrRateLimited   ErrorCode = 4
 )
 
 type Role byte
@@ -77,8 +86,8 @@ const (
 	StateDisconnected SessionState = 3
 )
 
-// SessionStats is one entry of a STATS report: the host's view of the path
-// to one joiner.
+// SessionStats is one entry of a STATS report: the reporter's view of the
+// path to one peer.
 type SessionStats struct {
 	SessionID uint64
 	State     SessionState
@@ -105,23 +114,22 @@ var (
 	ErrTrailing    = errors.New("protocol: trailing bytes")
 )
 
-// Message is the payload of a packet.
+// Message is the payload of a packet or frame.
 type Message interface {
 	Type() Type
 }
 
 type Register struct {
-	Nonce      uint64
 	Host       bool
 	Candidates []Candidate
 }
 
 type Registered struct {
-	Nonce    uint64
+	ClientID uint64
 	Secret   auth.Key
-	Observed netip.AddrPort
 	Lobby    LobbyID // zero unless the client registered as host
-	TTLSecs  uint16
+	// BindSecs is how often the client should refresh its UDP binding.
+	BindSecs uint16
 }
 
 type Join struct {
@@ -136,17 +144,25 @@ type PeerInfo struct {
 }
 
 type Error struct {
-	Code   ErrorCode
-	RefSeq uint32
+	Code ErrorCode
 }
 
 type Close struct {
 	Reason byte
 }
 
-// Stats is sent by a host to report its sessions. It is never answered.
+// Stats reports sessions' path quality. It is never answered.
 type Stats struct {
 	Sessions []SessionStats
+}
+
+// Bind is sent over UDP from the client's game socket so the server can
+// observe its public endpoint. It is never answered over UDP.
+type Bind struct{}
+
+// Bound tells the client the public endpoint its BIND came from.
+type Bound struct {
+	Observed netip.AddrPort
 }
 
 type Ping struct {
@@ -179,13 +195,17 @@ func (*PeerInfo) Type() Type   { return TypePeerInfo }
 func (*Error) Type() Type      { return TypeError }
 func (*Close) Type() Type      { return TypeClose }
 func (*Stats) Type() Type      { return TypeStats }
+func (*Bind) Type() Type       { return TypeBind }
+func (*Bound) Type() Type      { return TypeBound }
 func (*Ping) Type() Type       { return TypePing }
 func (*Pong) Type() Type       { return TypePong }
 func (*Check) Type() Type      { return TypeCheck }
 func (*CheckAck) Type() Type   { return TypeCheckAck }
 func (*Data) Type() Type       { return TypeData }
 
-// Packet is a decoded header plus message. The auth tag is checked with
+// ---- UDP packets ------------------------------------------------------------
+
+// Packet is a decoded UDP header plus message. The auth tag is checked with
 // Verify against the raw bytes.
 type Packet struct {
 	ID  uint64
@@ -193,9 +213,11 @@ type Packet struct {
 	Msg Message
 }
 
-// Seal encodes p, appends it to b, and fills in the MAC. A nil key leaves
-// the auth field zeroed (unauthenticated packet).
-func Seal(b []byte, p Packet, key *auth.Key, dir auth.Dir) ([]byte, error) {
+// Seal encodes p, appends it to b, and fills in the MAC.
+func Seal(b []byte, p Packet, key auth.Key, dir auth.Dir) ([]byte, error) {
+	if !packetTypes[p.Msg.Type()] {
+		return nil, fmt.Errorf("%w: %T is not sent over UDP", ErrUnknownType, p.Msg)
+	}
 	start := len(b)
 	b = append(b, magic[0], magic[1], Version, byte(p.Msg.Type()))
 	b = binary.BigEndian.AppendUint64(b, p.ID)
@@ -206,11 +228,9 @@ func Seal(b []byte, p Packet, key *auth.Key, dir auth.Dir) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if key != nil {
-		pkt := b[start:]
-		tag := auth.MAC(*key, dir, pkt[:16], pkt[HeaderLen:])
-		copy(pkt[16:HeaderLen], tag[:])
-	}
+	pkt := b[start:]
+	tag := auth.MAC(key, dir, pkt[:16], pkt[HeaderLen:])
+	copy(pkt[16:HeaderLen], tag[:])
 	return b, nil
 }
 
@@ -222,25 +242,97 @@ func Verify(pkt []byte, key auth.Key, dir auth.Dir) bool {
 	return auth.Verify(key, dir, pkt[16:HeaderLen], pkt[:16], pkt[HeaderLen:])
 }
 
+// Decode parses a UDP packet. It does not verify the MAC.
+func Decode(b []byte) (Packet, error) {
+	if len(b) < HeaderLen {
+		return Packet{}, ErrShort
+	}
+	if b[0] != magic[0] || b[1] != magic[1] {
+		return Packet{}, ErrBadMagic
+	}
+	if b[2] != Version {
+		return Packet{}, ErrBadVersion
+	}
+	ty := Type(b[3])
+	if !packetTypes[ty] {
+		return Packet{}, ErrUnknownType
+	}
+	msg, err := decodePayload(ty, b[HeaderLen:])
+	if err != nil {
+		return Packet{}, err
+	}
+	return Packet{
+		ID:  binary.BigEndian.Uint64(b[4:12]),
+		Seq: binary.BigEndian.Uint32(b[12:16]),
+		Msg: msg,
+	}, nil
+}
+
+// ---- Signalling frames --------------------------------------------------------
+
+// AppendFrame encodes m as a signalling frame: len u16, type u8, body.
+func AppendFrame(b []byte, m Message) ([]byte, error) {
+	if !frameTypes[m.Type()] {
+		return nil, fmt.Errorf("%w: %T is not a signalling message", ErrUnknownType, m)
+	}
+	start := len(b)
+	b = append(b, 0, 0, byte(m.Type()))
+	b, err := appendPayload(b, m)
+	if err != nil {
+		return nil, err
+	}
+	n := len(b) - start - 2
+	if n > MaxFrameLen {
+		return nil, fmt.Errorf("%w: frame too long", ErrBadField)
+	}
+	binary.BigEndian.PutUint16(b[start:], uint16(n))
+	return b, nil
+}
+
+// ReadFrame reads and decodes one signalling frame.
+func ReadFrame(r io.Reader) (Message, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint16(hdr[:]))
+	if n == 0 || n > MaxFrameLen {
+		return nil, fmt.Errorf("%w: frame length %d", ErrBadField, n)
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	return DecodeFrame(body)
+}
+
+// DecodeFrame decodes a frame's type byte and body (without the length).
+func DecodeFrame(b []byte) (Message, error) {
+	if len(b) == 0 {
+		return nil, ErrShort
+	}
+	ty := Type(b[0])
+	if !frameTypes[ty] {
+		return nil, ErrUnknownType
+	}
+	return decodePayload(ty, b[1:])
+}
+
+// ---- Payloads -------------------------------------------------------------
+
 func appendPayload(b []byte, m Message) ([]byte, error) {
 	var err error
 	switch m := m.(type) {
 	case *Register:
-		start := len(b)
-		b = binary.BigEndian.AppendUint64(b, m.Nonce)
 		b = append(b, boolFlag(m.Host, flagHost))
 		if b, err = appendCandidates(b, m.Candidates); err != nil {
 			return nil, err
 		}
-		if pad := MinRegisterPayload - (len(b) - start); pad > 0 {
-			b = append(b, make([]byte, pad)...)
-		}
 	case *Registered:
-		b = binary.BigEndian.AppendUint64(b, m.Nonce)
+		b = binary.BigEndian.AppendUint64(b, m.ClientID)
 		b = append(b, m.Secret[:]...)
-		b = appendEndpoint(b, m.Observed)
 		b = append(b, m.Lobby[:]...)
-		b = binary.BigEndian.AppendUint16(b, m.TTLSecs)
+		b = binary.BigEndian.AppendUint16(b, m.BindSecs)
 	case *Join:
 		if m.Lobby.IsZero() {
 			return nil, fmt.Errorf("%w: empty lobby id", ErrBadField)
@@ -255,7 +347,6 @@ func appendPayload(b []byte, m Message) ([]byte, error) {
 		}
 	case *Error:
 		b = append(b, byte(m.Code))
-		b = binary.BigEndian.AppendUint32(b, m.RefSeq)
 	case *Close:
 		b = append(b, m.Reason)
 	case *Stats:
@@ -270,6 +361,9 @@ func appendPayload(b []byte, m Message) ([]byte, error) {
 			b = binary.BigEndian.AppendUint32(b, st.RTTVarMicros)
 			b = binary.BigEndian.AppendUint16(b, st.LossPermille)
 		}
+	case *Bind:
+	case *Bound:
+		b = appendEndpoint(b, m.Observed)
 	case *Ping:
 		b = binary.BigEndian.AppendUint32(b, m.ID)
 	case *Pong:
@@ -292,82 +386,65 @@ func appendPayload(b []byte, m Message) ([]byte, error) {
 	return b, nil
 }
 
-// Decode parses a packet. It does not verify the MAC.
-func Decode(b []byte) (Packet, error) {
-	if len(b) < HeaderLen {
-		return Packet{}, ErrShort
-	}
-	if b[0] != magic[0] || b[1] != magic[1] {
-		return Packet{}, ErrBadMagic
-	}
-	if b[2] != Version {
-		return Packet{}, ErrBadVersion
-	}
-	p := Packet{
-		ID:  binary.BigEndian.Uint64(b[4:12]),
-		Seq: binary.BigEndian.Uint32(b[12:16]),
-	}
-
-	payload := b[HeaderLen:]
+func decodePayload(ty Type, payload []byte) (Message, error) {
 	r := reader{b: payload}
-	switch Type(b[3]) {
+	var m Message
+	switch ty {
 	case TypeRegister:
-		m := &Register{Nonce: r.u64(), Host: r.u8()&flagHost != 0, Candidates: r.candidates()}
-		if r.err == nil && len(payload) < MinRegisterPayload {
-			r.err = ErrShort
-		}
-		r.zeroPadding()
-		p.Msg = m
+		m = &Register{Host: r.u8()&flagHost != 0, Candidates: r.candidates()}
 	case TypeRegistered:
-		m := &Registered{Nonce: r.u64()}
-		copy(m.Secret[:], r.take(16))
-		m.Observed = r.endpoint()
-		m.Lobby = r.lobbyID()
-		m.TTLSecs = r.u16()
-		p.Msg = m
+		reg := &Registered{ClientID: r.u64()}
+		copy(reg.Secret[:], r.take(16))
+		reg.Lobby = r.lobbyID()
+		reg.BindSecs = r.u16()
+		m = reg
 	case TypeJoin:
-		m := &Join{Lobby: r.lobbyID()}
-		if r.err == nil && m.Lobby.IsZero() {
+		j := &Join{Lobby: r.lobbyID()}
+		if r.err == nil && j.Lobby.IsZero() {
 			r.err = ErrBadField
 		}
-		p.Msg = m
+		m = j
 	case TypePeerInfo:
-		m := &PeerInfo{SessionID: r.u64(), Role: Role(r.u8())}
-		if r.err == nil && m.Role != RoleControlling && m.Role != RoleControlled {
+		pi := &PeerInfo{SessionID: r.u64(), Role: Role(r.u8())}
+		if r.err == nil && pi.Role != RoleControlling && pi.Role != RoleControlled {
 			r.err = ErrBadField
 		}
-		copy(m.Key[:], r.take(16))
-		m.Candidates = r.candidates()
-		p.Msg = m
+		copy(pi.Key[:], r.take(16))
+		pi.Candidates = r.candidates()
+		m = pi
 	case TypeError:
-		p.Msg = &Error{Code: ErrorCode(r.u8()), RefSeq: r.u32()}
+		m = &Error{Code: ErrorCode(r.u8())}
 	case TypeClose:
-		p.Msg = &Close{Reason: r.u8()}
+		m = &Close{Reason: r.u8()}
 	case TypeStats:
-		p.Msg = &Stats{Sessions: r.stats()}
+		m = &Stats{Sessions: r.stats()}
+	case TypeBind:
+		m = &Bind{}
+	case TypeBound:
+		m = &Bound{Observed: r.endpoint()}
 	case TypePing:
-		p.Msg = &Ping{ID: r.u32()}
+		m = &Ping{ID: r.u32()}
 	case TypePong:
-		p.Msg = &Pong{ID: r.u32()}
+		m = &Pong{ID: r.u32()}
 	case TypeCheck:
-		p.Msg = &Check{TxID: r.u64(), Nominate: r.u8()&flagNominate != 0}
+		m = &Check{TxID: r.u64(), Nominate: r.u8()&flagNominate != 0}
 	case TypeCheckAck:
-		p.Msg = &CheckAck{TxID: r.u64(), Nominate: r.u8()&flagNominate != 0, Observed: r.endpoint()}
+		m = &CheckAck{TxID: r.u64(), Nominate: r.u8()&flagNominate != 0, Observed: r.endpoint()}
 	case TypeData:
 		if len(payload) > MaxDataLen {
-			return Packet{}, ErrBadField
+			return nil, ErrBadField
 		}
-		p.Msg = &Data{Payload: append([]byte(nil), r.take(len(payload))...)}
+		m = &Data{Payload: append([]byte(nil), r.take(len(payload))...)}
 	default:
-		return Packet{}, ErrUnknownType
+		return nil, ErrUnknownType
 	}
 	if r.err != nil {
-		return Packet{}, r.err
+		return nil, r.err
 	}
 	if len(r.b) != 0 {
-		return Packet{}, ErrTrailing
+		return nil, ErrTrailing
 	}
-	return p, nil
+	return m, nil
 }
 
 func boolFlag(set bool, flag byte) byte {
@@ -520,12 +597,4 @@ func (r *reader) lobbyID() LobbyID {
 		r.fail(ErrBadField)
 	}
 	return l
-}
-
-func (r *reader) zeroPadding() {
-	for _, c := range r.take(len(r.b)) {
-		if c != 0 {
-			r.fail(ErrTrailing)
-		}
-	}
 }

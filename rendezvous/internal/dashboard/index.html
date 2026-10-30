@@ -42,6 +42,16 @@
   .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
   .empty { padding: 32px 16px; text-align: center; color: var(--muted); }
   #error { color: var(--bad); }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
+  h2 .muted { font-weight: 400; font-size: 13px; }
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .flags { display: flex; flex-wrap: wrap; gap: 4px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .kv { padding: 12px 14px; }
+  .kv h3 { margin: 0 0 6px; font-size: 12px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .kv dl { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; margin: 0; font-variant-numeric: tabular-nums; }
+  .kv dd { margin: 0; text-align: right; font-weight: 600; }
+  .kv dt.zero + dd, .kv dt.zero { color: var(--muted); font-weight: 400; }
 </style>
 </head>
 <body>
@@ -55,9 +65,16 @@
     <div class="stat"><div class="label">Players in lobbies</div><div class="value" id="s-players">–</div></div>
     <div class="stat"><div class="label">Connected</div><div class="value" id="s-connected">–</div></div>
     <div class="stat"><div class="label">Registered clients</div><div class="value" id="s-clients">–</div></div>
+    <div class="stat"><div class="label">Unbound (UDP blocked?)</div><div class="value" id="s-unbound">–</div></div>
     <div class="stat"><div class="label">Uptime</div><div class="value" id="s-uptime">–</div></div>
   </section>
   <section id="lobbies"></section>
+
+  <h2>Clients <span class="muted">· everyone connected to the server</span></h2>
+  <section id="clients" class="panel"></section>
+
+  <h2>Server <span class="muted">· counts since start</span></h2>
+  <section id="counters" class="grid"></section>
 </main>
 <script>
 "use strict";
@@ -124,18 +141,101 @@ function lobbyCard(l, maxLobby) {
   return el("article", { class: "lobby" }, head, el("div", { class: "scroll" }, table));
 }
 
+// A client whose BIND has not arrived after this long probably cannot send UDP.
+const UNBOUND_SUSPECT_S = 5;
+
+function badge(text, cls, title) {
+  return el("span", { class: "badge " + cls, title }, text);
+}
+
+function clientFlags(c) {
+  const flags = [];
+  if (!c.bound) {
+    flags.push(c.connected >= UNBOUND_SUSPECT_S
+      ? badge("no UDP for " + duration(c.connected), "bad", "BIND never arrived: UDP is probably blocked on this network")
+      : badge("binding…", "warn", "waiting for the first BIND"));
+  }
+  if (c.addrMismatch) {
+    flags.push(badge("TLS ≠ UDP IP", "warn", "signalling and game traffic leave from different public IPs (carrier-grade NAT, VPN, multiple uplinks)"));
+  }
+  if (c.rebinds > 0) {
+    flags.push(badge(c.rebinds + (c.rebinds === 1 ? " rebind" : " rebinds"), c.rebinds > 2 ? "bad" : "warn",
+      "the NAT changed this client's public game port mid-session"));
+  }
+  return flags.length ? el("div", { class: "flags" }, ...flags) : el("span", { class: "muted" }, "–");
+}
+
+function clientsTable(clients) {
+  if (clients.length === 0) return el("div", { class: "empty" }, "No clients connected");
+  const th = (t, num) => el("th", num ? { class: "num" } : {}, t);
+  const row = c => el("tr", {},
+    el("td", {}, el("code", {}, c.id.slice(0, 8))),
+    el("td", {}, c.role + (c.lobby ? " · " : ""), c.lobby ? el("code", {}, c.lobby) : ""),
+    el("td", {}, el("code", {}, c.tlsAddr)),
+    el("td", {}, el("code", { class: c.bound ? "" : "muted" }, c.udpAddr)),
+    el("td", {}, clientFlags(c)),
+    metric(c.serverRttMs, "ms", grade(c.serverRttMs, 80, 200)),
+    el("td", { class: "num muted" }, c.bound ? duration(c.lastBind) + " ago" : "–"),
+    el("td", { class: "num muted" }, duration(c.connected)),
+  );
+  return el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {},
+      th("Client"), th("Role"), th("TLS IP"), th("UDP endpoint"), th("Flags"), th("Server RTT", 1), th("Last BIND", 1), th("Connected", 1))),
+    el("tbody", {}, ...clients.map(row)),
+  ));
+}
+
+function kv(title, entries) {
+  const rows = entries.flatMap(([k, v]) => [el("dt", v ? {} : { class: "zero" }, k), el("dd", {}, String(v))]);
+  return el("div", { class: "panel kv" }, el("h3", {}, title), el("dl", {}, ...rows));
+}
+
+function fromMap(m, order) {
+  const keys = [...order, ...Object.keys(m).filter(k => !order.includes(k)).sort()];
+  return keys.map(k => [k, m[k] || 0]);
+}
+
+function lifetime(l) {
+  return l.count === 0 ? [["ended", 0]] : [
+    ["ended", l.count], ["median", duration(l.p50)], ["90th percentile", duration(l.p90)], ["longest", duration(l.max)],
+  ];
+}
+
+function countersGrid(snap) {
+  const c = snap.counters;
+  return [
+    kv("Connections", [
+      ["accepted", c.connections], ["rate limited", c.rateLimited], ["handshake failures", c.handshakeFailures],
+      ["registered hosts", c.hosts], ["registered players", c.players], ["dropped (too slow)", c.slowDropped],
+    ]),
+    kv("Joins", fromMap(c.joins, ["ok", "lobby not found", "lobby full", "rate limited", "not bound", "retry"])),
+    kv("UDP binding", [
+      ["NAT rebinds", c.rebinds],
+      ...fromMap(c.bindsRejected, ["bad mac", "replay", "unknown client", "malformed"]).map(([k, v]) => ["rejected: " + k, v]),
+    ]),
+    kv("Disconnects", fromMap(c.disconnects, ["left", "connection closed", "idle timeout", "slow client", "protocol error", "bad request"])),
+    kv("Client lifetimes", lifetime(snap.lifetimes.clients)),
+    kv("Lobby lifetimes", lifetime(snap.lifetimes.lobbies)),
+  ];
+}
+
 function render(snap) {
   const sessions = snap.lobbies.flatMap(l => l.sessions);
   document.getElementById("s-lobbies").textContent = snap.lobbies.length;
   document.getElementById("s-players").textContent = snap.lobbies.length + sessions.length;
   document.getElementById("s-connected").textContent = sessions.filter(s => s.state === "connected").length;
   document.getElementById("s-clients").textContent = snap.clients;
+  const unbound = document.getElementById("s-unbound");
+  unbound.textContent = snap.unbound;
+  unbound.className = "value " + (snap.unbound ? "warn" : "");
   document.getElementById("s-uptime").textContent = duration(snap.uptime);
 
   const root = document.getElementById("lobbies");
   root.replaceChildren(...(snap.lobbies.length
     ? snap.lobbies.map(l => lobbyCard(l, snap.maxLobby))
     : [el("div", { class: "lobby empty" }, "No open lobbies")]));
+  document.getElementById("clients").replaceChildren(clientsTable(snap.clientList));
+  document.getElementById("counters").replaceChildren(...countersGrid(snap));
   document.getElementById("updated").textContent = "updated " + new Date(snap.time).toLocaleTimeString();
 }
 

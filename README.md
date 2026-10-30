@@ -5,12 +5,14 @@ on [Peer-to-Peer Communication Across Network Address Translators](https://pdos.
 (Ford, Srisuresh, Kegel).
 
 A host opens a lobby and gets a short code like `K7M2QX`. Players join with
-the code. The rendezvous server introduces each joiner to the host, both sides
-punch through their NATs with authenticated checks, and game data then flows
-directly between them.
+the code. Signalling with the rendezvous server runs over TLS; each client
+also sends an authenticated UDP `BIND` from its game socket so the server
+learns its public endpoint. The server introduces each joiner to the host,
+both sides punch through their NATs with authenticated checks, and game data
+then flows directly between them.
 
 - **`rendezvous/`**: the rendezvous server, in Go (standard library only).
-- **`client/`**: the peer library, in Rust (only `hmac` + `sha2`).
+- **`client/`**: the peer library, in Rust (`rustls` + `ring` + `webpki-roots`).
 - **`docs/design.md`**: design, state machines, security model, limitations.
 - **`docs/protocol.md`**: the wire format, plus shared test vectors in `docs/testdata/`.
 
@@ -29,6 +31,7 @@ directly between them.
 │   └── internal/
 │       ├── protocol/         # packet encoding/decoding, lobby IDs
 │       ├── auth/             # HMAC tags, replay window
+│       ├── devcert/          # development CA + certificate generation
 │       ├── ratelimit/        # per-IP token bucket
 │       ├── registry/         # clients, lobbies, sessions, stats snapshot
 │       └── dashboard/        # web view of lobbies and connection stats
@@ -41,7 +44,7 @@ directly between them.
         ├── src/session.rs    # session typestate machine (sans-IO)
         ├── src/agent.rs      # registration, lobby, session routing (sans-IO)
         ├── src/stats.rs      # PING/PONG RTT, jitter and loss
-        ├── src/client.rs     # std::net::UdpSocket driver
+        ├── src/client.rs     # TLS + UdpSocket driver
         ├── src/sim.rs        # NAT/loss simulation tests
         └── examples/         # host.rs, join.rs, bridge.rs (stdin/stdout driver)
 scripts/
@@ -70,7 +73,7 @@ example.
 just datatest bench                                   # echo test: loss, dupes, corruption, RTT
 just datatest --players 4 bench --count 2000 --size 1000 --rate 250
 just datatest chat                                    # type messages between host and players
-just datatest --server 1.2.3.4:7777 bench             # across real NATs
+just datatest --server rv.example.com:7777 bench      # across real NATs (add --ca for a private CA)
 just datatest --dashboard 127.0.0.1:8080 chat         # watch it on the dashboard
 ```
 
@@ -84,15 +87,25 @@ its own queues add latency and loss. That is far above typical game rates.
 To run the pieces by hand:
 
 ```sh
-just rendezvous::run -addr :7777
-just client::host 1.2.3.4:7777            # prints "lobby K7M2QX"
-just client::join 1.2.3.4:7777 K7M2QX bob
+just rendezvous::run -addr :7777            # writes its dev CA to bin/dev-ca.pem
+just client::host 127.0.0.1:7777            # prints "lobby K7M2QX"
+just client::join 127.0.0.1:7777 K7M2QX bob
 ```
+
+### TLS
+
+Clients verify the server's certificate. In production, give the server a
+real certificate (`-tls-cert`, `-tls-key`); clients use the public roots
+(`ServerTrust::PublicRoots`). Without a certificate, the server generates a
+development CA, writes it to `-tls-dev-ca`, and serves a certificate for
+`-tls-dev-hosts` (localhost by default; add your LAN IP or hostname to test
+across machines). Clients then trust that file (`ServerTrust::ca_file`). The
+examples and the test script read it from `$KNOCKKNOCK_CA`.
 
 ## Using the library
 
 ```rust
-let mut host = Client::host(server)?;
+let mut host = Client::host("rv.example.com:7777", ServerTrust::PublicRoots)?;
 loop {
     match host.poll()? {          // non-blocking: call once per frame
         Some(Event::Registered { lobby: Some(lobby), .. }) => show_code(lobby),
@@ -103,30 +116,40 @@ loop {
 }
 ```
 
-`Client` drives a `std::net::UdpSocket`. To own the I/O yourself, drive an
-`Agent` instead. It is sans-IO: you feed it datagrams and the current time, and
-it hands back datagrams to send and events.
+`Client` drives the TLS connection and a `std::net::UdpSocket`. To own the
+I/O yourself, drive an `Agent` instead. It is sans-IO: you feed it datagrams,
+decrypted signalling bytes and the current time, and it hands back datagrams,
+signalling bytes and events.
 
 ## Dashboard
 
 The rendezvous server serves a stats page (`-http`, default
-`127.0.0.1:8080`). It lists every lobby, and for each joiner shows its state,
-path type, RTT, jitter and loss, as measured by the host's pings and reported
-every 5 s. It shows lobby IDs, so keep it private.
+`127.0.0.1:8080`), refreshed every 2 s:
+
+- **Lobbies:** for each joiner, its state, path type, RTT, jitter and loss, as
+  measured by the host's pings and reported every 5 s.
+- **Clients:** everyone connected, with their TLS IP and UDP endpoint and
+  server-measured signalling latency. Clients are flagged when their UDP
+  `BIND` never arrived (UDP probably blocked), when their TLS and UDP IPs
+  differ, or when their NAT rebinds.
+- **Server counters:** connections, joins by outcome, rejected `BIND`s,
+  disconnects by reason, and client and lobby lifetimes.
+
+It shows lobby IDs, so keep it private. The same data is at `/api/lobbies` as
+JSON.
 
 ## Godot
 
-Game traffic stays on the knockknock socket as authenticated `DATA` packets.
-That keeps the punched NAT mappings in use and lets the host accept late
-joiners. The planned Godot integration is a GDExtension exposing a
-`MultiplayerPeerExtension`, built on the [`godot`](https://github.com/godot-rust/gdext)
-crate in its own workspace member so the core library keeps its small
-dependency set. `DATA` is unreliable for now; reliable channels for RPCs come
-with that work.
+Target: Godot 4.7.2. knockknock does matchmaking and the authenticated
+handshake, then hands the punched port to Godot's own `ENetMultiplayerPeer`,
+in the style of netfox.noray. Hosts and joiners can also send path stats,
+handshake reports and debug events to the rendezvous server for the dashboard.
+See [design.md §15–16](docs/design.md#15-godot-integration-hand-off-to-enet).
+The GDExtension is not built yet.
 
 ## Limitations
 
 See [design.md §13](docs/design.md#13-known-limitations). In short: no relay
-yet, so two symmetric NATs fail with `NoPath`. There is no signalling
-encryption (the threat model is off-path attackers), and only the primary
-network interface is used as a host candidate.
+yet, so two symmetric NATs fail with `NoPath`. Only the primary network
+interface is used as a host candidate, and clients do not yet reconnect to the
+server automatically.

@@ -1,4 +1,6 @@
-//! The knockknock wire format, as described in `docs/protocol.md`.
+//! The knockknock wire format, as described in `docs/protocol.md`: UDP
+//! packets with an authenticated header, and length-prefixed frames on the
+//! TLS signalling connection.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -8,15 +10,14 @@ use crate::auth::{self, Dir, Key, TAG_LEN};
 use crate::candidate::{Candidate, CandidateKind};
 
 pub const MAGIC: [u8; 2] = *b"KK";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const HEADER_LEN: usize = 32;
 pub const MAX_CANDIDATES: usize = 8;
 pub const MAX_DATA_LEN: usize = 1168;
 pub const MAX_STATS: usize = 16;
 pub const LOBBY_ID_LEN: usize = 6;
-/// The largest possible REGISTERED payload. REGISTER is padded to at least
-/// this size so the server never amplifies.
-pub const MIN_REGISTER_PAYLOAD: usize = 8 + 16 + 19 + LOBBY_ID_LEN + 2;
+/// Bounds a signalling frame's type byte plus body.
+pub const MAX_FRAME_LEN: usize = 4096;
 
 const TYPE_REGISTER: u8 = 0x01;
 const TYPE_REGISTERED: u8 = 0x02;
@@ -25,20 +26,47 @@ const TYPE_PEER_INFO: u8 = 0x04;
 const TYPE_ERROR: u8 = 0x05;
 const TYPE_CLOSE: u8 = 0x06;
 const TYPE_STATS: u8 = 0x07;
+const TYPE_BIND: u8 = 0x08;
+const TYPE_BOUND: u8 = 0x09;
 const TYPE_CHECK: u8 = 0x10;
 const TYPE_CHECK_ACK: u8 = 0x11;
 const TYPE_PING: u8 = 0x12;
 const TYPE_PONG: u8 = 0x13;
 const TYPE_DATA: u8 = 0x20;
 
+/// Message types carried in UDP packets.
+fn is_packet_type(t: u8) -> bool {
+    matches!(
+        t,
+        TYPE_BIND | TYPE_CLOSE | TYPE_CHECK | TYPE_CHECK_ACK | TYPE_PING | TYPE_PONG | TYPE_DATA
+    )
+}
+
+/// Message types carried in signalling frames.
+fn is_frame_type(t: u8) -> bool {
+    matches!(
+        t,
+        TYPE_REGISTER
+            | TYPE_REGISTERED
+            | TYPE_JOIN
+            | TYPE_PEER_INFO
+            | TYPE_ERROR
+            | TYPE_CLOSE
+            | TYPE_STATS
+            | TYPE_BOUND
+            | TYPE_PING
+            | TYPE_PONG
+    )
+}
+
 const FLAG_HOST: u8 = 1;
 const FLAG_NOMINATE: u8 = 1;
 
-/// A decoded packet. The auth tag is checked separately against the raw
+/// A decoded UDP packet. The auth tag is checked separately against the raw
 /// bytes with [`verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
-    /// Client ID (client↔server) or session ID (peer↔peer); 0 = none.
+    /// Client ID (BIND) or session ID (peer↔peer).
     pub id: u64,
     pub seq: u32,
     pub msg: Message,
@@ -46,17 +74,17 @@ pub struct Packet {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
+    // Signalling (frames).
     Register {
-        nonce: u64,
         host: bool,
         candidates: Vec<Candidate>,
     },
     Registered {
-        nonce: u64,
+        client_id: u64,
         secret: Key,
-        observed: SocketAddr,
         lobby: Option<LobbyId>,
-        ttl_secs: u16,
+        /// How often to refresh the UDP binding.
+        bind_secs: u16,
     },
     Join {
         lobby: LobbyId,
@@ -69,13 +97,29 @@ pub enum Message {
     },
     Error {
         code: ErrorCode,
-        ref_seq: u32,
     },
+    /// Leaves the server (frame) or ends a session (packet).
     Close {
         reason: u8,
     },
-    /// A host's report on its sessions. Never answered.
+    /// Path quality report. Never answered.
     Stats(Vec<StatsEntry>),
+    /// The public endpoint our BIND came from.
+    Bound {
+        observed: SocketAddr,
+    },
+    /// Heartbeat (frame) or path RTT probe (packet).
+    Ping {
+        id: u32,
+    },
+    Pong {
+        id: u32,
+    },
+
+    // UDP.
+    /// Sent to the server from the game socket so it can observe our public
+    /// endpoint. Answered over TLS with `Bound`.
+    Bind,
     Check {
         txid: u64,
         nominate: bool,
@@ -84,12 +128,6 @@ pub enum Message {
         txid: u64,
         nominate: bool,
         observed: SocketAddr,
-    },
-    Ping {
-        id: u32,
-    },
-    Pong {
-        id: u32,
     },
     Data(Vec<u8>),
 }
@@ -102,7 +140,7 @@ pub enum ReportedState {
     Disconnected = 3,
 }
 
-/// One entry of a STATS report: the host's view of the path to one joiner.
+/// One entry of a STATS report: the reporter's view of the path to one peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatsEntry {
     pub session_id: u64,
@@ -130,20 +168,20 @@ pub enum Role {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
-    BadAuth,
-    UnknownClient,
+    BadRequest,
     LobbyNotFound,
     LobbyFull,
+    RateLimited,
     Unknown(u8),
 }
 
 impl From<u8> for ErrorCode {
     fn from(v: u8) -> Self {
         match v {
-            1 => Self::BadAuth,
-            2 => Self::UnknownClient,
-            3 => Self::LobbyNotFound,
-            4 => Self::LobbyFull,
+            1 => Self::BadRequest,
+            2 => Self::LobbyNotFound,
+            3 => Self::LobbyFull,
+            4 => Self::RateLimited,
             v => Self::Unknown(v),
         }
     }
@@ -152,10 +190,10 @@ impl From<u8> for ErrorCode {
 impl From<ErrorCode> for u8 {
     fn from(c: ErrorCode) -> Self {
         match c {
-            ErrorCode::BadAuth => 1,
-            ErrorCode::UnknownClient => 2,
-            ErrorCode::LobbyNotFound => 3,
-            ErrorCode::LobbyFull => 4,
+            ErrorCode::BadRequest => 1,
+            ErrorCode::LobbyNotFound => 2,
+            ErrorCode::LobbyFull => 3,
+            ErrorCode::RateLimited => 4,
             ErrorCode::Unknown(v) => v,
         }
     }
@@ -164,10 +202,10 @@ impl From<ErrorCode> for u8 {
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadAuth => f.write_str("bad authentication"),
-            Self::UnknownClient => f.write_str("unknown client"),
+            Self::BadRequest => f.write_str("bad request"),
             Self::LobbyNotFound => f.write_str("lobby not found"),
             Self::LobbyFull => f.write_str("lobby full"),
+            Self::RateLimited => f.write_str("rate limited"),
             Self::Unknown(v) => write!(f, "unknown error code {v}"),
         }
     }
@@ -239,21 +277,22 @@ impl fmt::Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 impl Packet {
-    /// Encodes the packet. With `seal`, the auth field carries the MAC;
-    /// without, it is zeroed (unauthenticated packet).
-    pub fn encode(&self, seal: Option<(&Key, Dir)>) -> Result<Vec<u8>, ProtocolError> {
+    /// Encodes and seals the packet.
+    pub fn encode(&self, key: &Key, dir: Dir) -> Result<Vec<u8>, ProtocolError> {
+        let ty = self.msg.type_byte();
+        if !is_packet_type(ty) {
+            return Err(ProtocolError::UnknownType(ty));
+        }
         let mut buf = Vec::with_capacity(HEADER_LEN + 64);
         buf.extend_from_slice(&MAGIC);
         buf.push(VERSION);
-        buf.push(self.msg.type_byte());
+        buf.push(ty);
         buf.extend_from_slice(&self.id.to_be_bytes());
         buf.extend_from_slice(&self.seq.to_be_bytes());
         buf.extend_from_slice(&[0; TAG_LEN]);
         self.msg.encode_payload(&mut buf)?;
-        if let Some((key, dir)) = seal {
-            let tag = auth::mac(key, dir, &buf);
-            buf[16..HEADER_LEN].copy_from_slice(&tag);
-        }
+        let tag = auth::mac(key, dir, &buf);
+        buf[16..HEADER_LEN].copy_from_slice(&tag);
         Ok(buf)
     }
 
@@ -268,86 +307,69 @@ impl Packet {
         if header[2] != VERSION {
             return Err(ProtocolError::BadVersion(header[2]));
         }
-        let id = u64::from_be_bytes(header[4..12].try_into().unwrap());
-        let seq = u32::from_be_bytes(header[12..16].try_into().unwrap());
-
-        let mut r = Reader(payload);
-        let msg = match header[3] {
-            TYPE_REGISTER => {
-                let msg = Message::Register {
-                    nonce: r.u64()?,
-                    host: r.u8()? & FLAG_HOST != 0,
-                    candidates: r.candidates()?,
-                };
-                if payload.len() < MIN_REGISTER_PAYLOAD {
-                    return Err(ProtocolError::Short);
-                }
-                if r.0.iter().any(|&b| b != 0) {
-                    return Err(ProtocolError::Trailing);
-                }
-                r.0 = &[];
-                msg
-            }
-            TYPE_REGISTERED => Message::Registered {
-                nonce: r.u64()?,
-                secret: r.take()?,
-                observed: r.endpoint()?,
-                lobby: LobbyId::from_bytes(r.take()?)?,
-                ttl_secs: u16::from_be_bytes(r.take()?),
-            },
-            TYPE_JOIN => Message::Join {
-                lobby: LobbyId::from_bytes(r.take()?)?.ok_or(ProtocolError::BadField)?,
-            },
-            TYPE_PEER_INFO => Message::PeerInfo {
-                session_id: r.u64()?,
-                role: match r.u8()? {
-                    1 => Role::Controlling,
-                    2 => Role::Controlled,
-                    _ => return Err(ProtocolError::BadField),
-                },
-                key: r.take()?,
-                candidates: r.candidates()?,
-            },
-            TYPE_ERROR => Message::Error {
-                code: r.u8()?.into(),
-                ref_seq: u32::from_be_bytes(r.take()?),
-            },
-            TYPE_CLOSE => Message::Close { reason: r.u8()? },
-            TYPE_STATS => Message::Stats(r.stats()?),
-            TYPE_PING => Message::Ping {
-                id: u32::from_be_bytes(r.take()?),
-            },
-            TYPE_PONG => Message::Pong {
-                id: u32::from_be_bytes(r.take()?),
-            },
-            TYPE_CHECK => Message::Check {
-                txid: r.u64()?,
-                nominate: r.u8()? & FLAG_NOMINATE != 0,
-            },
-            TYPE_CHECK_ACK => Message::CheckAck {
-                txid: r.u64()?,
-                nominate: r.u8()? & FLAG_NOMINATE != 0,
-                observed: r.endpoint()?,
-            },
-            TYPE_DATA => {
-                if payload.len() > MAX_DATA_LEN {
-                    return Err(ProtocolError::BadField);
-                }
-                r.0 = &[];
-                Message::Data(payload.to_vec())
-            }
-            t => return Err(ProtocolError::UnknownType(t)),
-        };
-        if !r.0.is_empty() {
-            return Err(ProtocolError::Trailing);
+        if !is_packet_type(header[3]) {
+            return Err(ProtocolError::UnknownType(header[3]));
         }
-        Ok(Self { id, seq, msg })
+        Ok(Self {
+            id: u64::from_be_bytes(header[4..12].try_into().unwrap()),
+            seq: u32::from_be_bytes(header[12..16].try_into().unwrap()),
+            msg: Message::decode_payload(header[3], payload)?,
+        })
     }
 }
 
 /// Reports whether `buf` (a whole packet) carries a valid MAC.
 pub fn verify(buf: &[u8], key: &Key, dir: Dir) -> bool {
     buf.len() >= HEADER_LEN && auth::verify(key, dir, buf)
+}
+
+/// Encodes a signalling frame: `len u16`, `type u8`, body.
+pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, ProtocolError> {
+    let ty = msg.type_byte();
+    if !is_frame_type(ty) {
+        return Err(ProtocolError::UnknownType(ty));
+    }
+    let mut buf = vec![0, 0, ty];
+    msg.encode_payload(&mut buf)?;
+    let len = buf.len() - 2;
+    if len > MAX_FRAME_LEN {
+        return Err(ProtocolError::BadField);
+    }
+    buf[..2].copy_from_slice(&(len as u16).to_be_bytes());
+    Ok(buf)
+}
+
+/// Reassembles signalling frames from a byte stream.
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+}
+
+impl FrameDecoder {
+    pub fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Returns the next complete frame, if any. An error means the stream
+    /// is corrupt and the connection should be dropped.
+    pub fn next_frame(&mut self) -> Result<Option<Message>, ProtocolError> {
+        let Some(&[hi, lo]) = self.buf.first_chunk::<2>() else {
+            return Ok(None);
+        };
+        let len = usize::from(u16::from_be_bytes([hi, lo]));
+        if len == 0 || len > MAX_FRAME_LEN {
+            return Err(ProtocolError::BadField);
+        }
+        if self.buf.len() < 2 + len {
+            return Ok(None);
+        }
+        let frame: Vec<u8> = self.buf.drain(..2 + len).skip(2).collect();
+        let ty = frame[0];
+        if !is_frame_type(ty) {
+            return Err(ProtocolError::UnknownType(ty));
+        }
+        Message::decode_payload(ty, &frame[1..]).map(Some)
+    }
 }
 
 impl Message {
@@ -360,6 +382,8 @@ impl Message {
             Self::Error { .. } => TYPE_ERROR,
             Self::Close { .. } => TYPE_CLOSE,
             Self::Stats(_) => TYPE_STATS,
+            Self::Bind => TYPE_BIND,
+            Self::Bound { .. } => TYPE_BOUND,
             Self::Ping { .. } => TYPE_PING,
             Self::Pong { .. } => TYPE_PONG,
             Self::Check { .. } => TYPE_CHECK,
@@ -370,30 +394,20 @@ impl Message {
 
     fn encode_payload(&self, buf: &mut Vec<u8>) -> Result<(), ProtocolError> {
         match self {
-            Self::Register {
-                nonce,
-                host,
-                candidates,
-            } => {
-                let start = buf.len();
-                buf.extend_from_slice(&nonce.to_be_bytes());
+            Self::Register { host, candidates } => {
                 buf.push(if *host { FLAG_HOST } else { 0 });
                 put_candidates(buf, candidates)?;
-                let len = buf.len() - start;
-                buf.resize(buf.len() + MIN_REGISTER_PAYLOAD.saturating_sub(len), 0);
             }
             Self::Registered {
-                nonce,
+                client_id,
                 secret,
-                observed,
                 lobby,
-                ttl_secs,
+                bind_secs,
             } => {
-                buf.extend_from_slice(&nonce.to_be_bytes());
+                buf.extend_from_slice(&client_id.to_be_bytes());
                 buf.extend_from_slice(secret);
-                put_endpoint(buf, *observed);
                 buf.extend_from_slice(&lobby.map_or([0; LOBBY_ID_LEN], |l| l.0));
-                buf.extend_from_slice(&ttl_secs.to_be_bytes());
+                buf.extend_from_slice(&bind_secs.to_be_bytes());
             }
             Self::Join { lobby } => buf.extend_from_slice(&lobby.0),
             Self::PeerInfo {
@@ -410,10 +424,7 @@ impl Message {
                 buf.extend_from_slice(key);
                 put_candidates(buf, candidates)?;
             }
-            Self::Error { code, ref_seq } => {
-                buf.push((*code).into());
-                buf.extend_from_slice(&ref_seq.to_be_bytes());
-            }
+            Self::Error { code } => buf.push((*code).into()),
             Self::Close { reason } => buf.push(*reason),
             Self::Stats(entries) => {
                 if entries.len() > MAX_STATS {
@@ -429,6 +440,8 @@ impl Message {
                     buf.extend_from_slice(&e.loss_permille.min(1000).to_be_bytes());
                 }
             }
+            Self::Bind => {}
+            Self::Bound { observed } => put_endpoint(buf, *observed),
             Self::Ping { id } | Self::Pong { id } => buf.extend_from_slice(&id.to_be_bytes()),
             Self::Check { txid, nominate } => {
                 buf.extend_from_slice(&txid.to_be_bytes());
@@ -451,6 +464,71 @@ impl Message {
             }
         }
         Ok(())
+    }
+
+    fn decode_payload(ty: u8, payload: &[u8]) -> Result<Self, ProtocolError> {
+        let mut r = Reader(payload);
+        let msg = match ty {
+            TYPE_REGISTER => Self::Register {
+                host: r.u8()? & FLAG_HOST != 0,
+                candidates: r.candidates()?,
+            },
+            TYPE_REGISTERED => Self::Registered {
+                client_id: r.u64()?,
+                secret: r.take()?,
+                lobby: LobbyId::from_bytes(r.take()?)?,
+                bind_secs: u16::from_be_bytes(r.take()?),
+            },
+            TYPE_JOIN => Self::Join {
+                lobby: LobbyId::from_bytes(r.take()?)?.ok_or(ProtocolError::BadField)?,
+            },
+            TYPE_PEER_INFO => Self::PeerInfo {
+                session_id: r.u64()?,
+                role: match r.u8()? {
+                    1 => Role::Controlling,
+                    2 => Role::Controlled,
+                    _ => return Err(ProtocolError::BadField),
+                },
+                key: r.take()?,
+                candidates: r.candidates()?,
+            },
+            TYPE_ERROR => Self::Error {
+                code: r.u8()?.into(),
+            },
+            TYPE_CLOSE => Self::Close { reason: r.u8()? },
+            TYPE_STATS => Self::Stats(r.stats()?),
+            TYPE_BIND => Self::Bind,
+            TYPE_BOUND => Self::Bound {
+                observed: r.endpoint()?,
+            },
+            TYPE_PING => Self::Ping {
+                id: u32::from_be_bytes(r.take()?),
+            },
+            TYPE_PONG => Self::Pong {
+                id: u32::from_be_bytes(r.take()?),
+            },
+            TYPE_CHECK => Self::Check {
+                txid: r.u64()?,
+                nominate: r.u8()? & FLAG_NOMINATE != 0,
+            },
+            TYPE_CHECK_ACK => Self::CheckAck {
+                txid: r.u64()?,
+                nominate: r.u8()? & FLAG_NOMINATE != 0,
+                observed: r.endpoint()?,
+            },
+            TYPE_DATA => {
+                if payload.len() > MAX_DATA_LEN {
+                    return Err(ProtocolError::BadField);
+                }
+                r.0 = &[];
+                Self::Data(payload.to_vec())
+            }
+            t => return Err(ProtocolError::UnknownType(t)),
+        };
+        if !r.0.is_empty() {
+            return Err(ProtocolError::Trailing);
+        }
+        Ok(msg)
     }
 }
 
@@ -576,92 +654,29 @@ mod tests {
         s.parse().unwrap()
     }
 
+    enum Vector {
+        Packet(Packet, Dir),
+        Frame(Message),
+    }
+
     /// Mirrors `vectors()` in rendezvous/internal/protocol/protocol_test.go.
-    fn vectors() -> Vec<(&'static str, Packet, Option<Dir>)> {
+    fn vectors() -> Vec<(&'static str, Vector)> {
         let lobby: LobbyId = "K7M2QX".parse().unwrap();
-        let p = |id, seq, msg| Packet { id, seq, msg };
+        let p = |id, seq, msg, dir| Vector::Packet(Packet { id, seq, msg }, dir);
+        let txid = 0x1122_3344_5566_7788;
         vec![
-            (
-                "register_initial",
-                p(
-                    0,
-                    0,
-                    Message::Register {
-                        nonce: 0x0102_0304_0506_0708,
-                        host: true,
-                        candidates: vec![Candidate::host(addr("192.168.1.20:5000"))],
-                    },
-                ),
-                None,
-            ),
-            (
-                "registered",
-                p(
-                    CLIENT,
-                    1,
-                    Message::Registered {
-                        nonce: 0x0102_0304_0506_0708,
-                        secret: KEY,
-                        observed: addr("198.51.100.25:41000"),
-                        lobby: Some(lobby),
-                        ttl_secs: 60,
-                    },
-                ),
-                Some(Dir::ServerToClient),
-            ),
-            (
-                "join",
-                p(CLIENT, 2, Message::Join { lobby }),
-                Some(Dir::ClientToServer),
-            ),
-            (
-                "peer_info",
-                p(
-                    CLIENT,
-                    3,
-                    Message::PeerInfo {
-                        session_id: SESSION,
-                        role: Role::Controlling,
-                        key: KEY,
-                        candidates: vec![
-                            Candidate::host(addr("10.0.0.2:4000")),
-                            Candidate {
-                                kind: CandidateKind::ServerReflexive,
-                                addr: addr("[2001:db8::1]:9000"),
-                            },
-                        ],
-                    },
-                ),
-                Some(Dir::ServerToClient),
-            ),
-            (
-                "error_unauth",
-                p(
-                    0,
-                    4,
-                    Message::Error {
-                        code: ErrorCode::UnknownClient,
-                        ref_seq: 7,
-                    },
-                ),
-                None,
-            ),
-            (
-                "close",
-                p(CLIENT, 5, Message::Close { reason: 0 }),
-                Some(Dir::ClientToServer),
-            ),
+            ("bind", p(CLIENT, 1, Message::Bind, Dir::ClientToServer)),
             (
                 "check",
                 p(
                     SESSION,
                     6,
                     Message::Check {
-                        txid: 0x1122_3344_5566_7788,
+                        txid,
                         nominate: true,
                     },
+                    Dir::HostToJoiner,
                 ),
-                Some(Dir::HostToJoiner),
             ),
             (
                 "check_ack",
@@ -669,54 +684,111 @@ mod tests {
                     SESSION,
                     7,
                     Message::CheckAck {
-                        txid: 0x1122_3344_5566_7788,
+                        txid,
                         nominate: true,
                         observed: addr("203.0.113.7:4242"),
                     },
+                    Dir::JoinerToHost,
                 ),
-                Some(Dir::JoinerToHost),
             ),
             (
                 "data",
-                p(SESSION, 8, Message::Data(b"hello".to_vec())),
-                Some(Dir::HostToJoiner),
-            ),
-            (
-                "stats",
                 p(
-                    CLIENT,
-                    9,
-                    Message::Stats(vec![
-                        StatsEntry {
-                            session_id: SESSION,
-                            state: ReportedState::Connected,
-                            path: Some(CandidateKind::ServerReflexive),
-                            rtt_us: Some(23500),
-                            rttvar_us: Some(1200),
-                            loss_permille: 25,
-                        },
-                        StatsEntry {
-                            session_id: 0x0102_0304_0506_0708,
-                            state: ReportedState::Connecting,
-                            path: None,
-                            rtt_us: None,
-                            rttvar_us: None,
-                            loss_permille: 0,
-                        },
-                    ]),
+                    SESSION,
+                    8,
+                    Message::Data(b"hello".to_vec()),
+                    Dir::HostToJoiner,
                 ),
-                Some(Dir::ClientToServer),
             ),
             (
                 "ping",
-                p(SESSION, 10, Message::Ping { id: 0xdead_beef }),
-                Some(Dir::HostToJoiner),
+                p(
+                    SESSION,
+                    10,
+                    Message::Ping { id: 0xdead_beef },
+                    Dir::HostToJoiner,
+                ),
             ),
             (
                 "pong",
-                p(SESSION, 11, Message::Pong { id: 0xdead_beef }),
-                Some(Dir::JoinerToHost),
+                p(
+                    SESSION,
+                    11,
+                    Message::Pong { id: 0xdead_beef },
+                    Dir::JoinerToHost,
+                ),
             ),
+            (
+                "close",
+                p(SESSION, 12, Message::Close { reason: 0 }, Dir::HostToJoiner),
+            ),
+            (
+                "frame_register",
+                Vector::Frame(Message::Register {
+                    host: true,
+                    candidates: vec![Candidate::host(addr("192.168.1.20:5000"))],
+                }),
+            ),
+            (
+                "frame_registered",
+                Vector::Frame(Message::Registered {
+                    client_id: CLIENT,
+                    secret: KEY,
+                    lobby: Some(lobby),
+                    bind_secs: 15,
+                }),
+            ),
+            ("frame_join", Vector::Frame(Message::Join { lobby })),
+            (
+                "frame_peer_info",
+                Vector::Frame(Message::PeerInfo {
+                    session_id: SESSION,
+                    role: Role::Controlling,
+                    key: KEY,
+                    candidates: vec![
+                        Candidate::host(addr("10.0.0.2:4000")),
+                        Candidate {
+                            kind: CandidateKind::ServerReflexive,
+                            addr: addr("[2001:db8::1]:9000"),
+                        },
+                    ],
+                }),
+            ),
+            (
+                "frame_error",
+                Vector::Frame(Message::Error {
+                    code: ErrorCode::LobbyFull,
+                }),
+            ),
+            (
+                "frame_bound",
+                Vector::Frame(Message::Bound {
+                    observed: addr("198.51.100.25:41000"),
+                }),
+            ),
+            (
+                "frame_stats",
+                Vector::Frame(Message::Stats(vec![
+                    StatsEntry {
+                        session_id: SESSION,
+                        state: ReportedState::Connected,
+                        path: Some(CandidateKind::ServerReflexive),
+                        rtt_us: Some(23500),
+                        rttvar_us: Some(1200),
+                        loss_permille: 25,
+                    },
+                    StatsEntry {
+                        session_id: 0x0102_0304_0506_0708,
+                        state: ReportedState::Connecting,
+                        path: None,
+                        rtt_us: None,
+                        rttvar_us: None,
+                        loss_permille: 0,
+                    },
+                ])),
+            ),
+            ("frame_ping", Vector::Frame(Message::Ping { id: 7 })),
+            ("frame_close", Vector::Frame(Message::Close { reason: 0 })),
         ]
     }
 
@@ -741,27 +813,66 @@ mod tests {
     #[test]
     fn matches_shared_vectors() {
         let want = shared_vectors();
-        for (name, packet, dir) in vectors() {
-            let buf = packet.encode(dir.map(|d| (&KEY, d))).unwrap();
-            assert_eq!(hex(&buf), want[name], "{name}: encoding differs from Go");
-            assert_eq!(Packet::decode(&buf).unwrap(), packet, "{name}: round trip");
-            if let Some(dir) = dir {
-                assert!(verify(&buf, &KEY, dir), "{name}: MAC does not verify");
+        assert_eq!(want.len(), vectors().len(), "vector sets differ");
+        for (name, v) in vectors() {
+            match v {
+                Vector::Packet(packet, dir) => {
+                    let buf = packet.encode(&KEY, dir).unwrap();
+                    assert_eq!(hex(&buf), want[name], "{name}: encoding differs from Go");
+                    assert_eq!(Packet::decode(&buf).unwrap(), packet, "{name}: round trip");
+                    assert!(verify(&buf, &KEY, dir), "{name}: MAC does not verify");
+                }
+                Vector::Frame(msg) => {
+                    let buf = encode_frame(&msg).unwrap();
+                    assert_eq!(hex(&buf), want[name], "{name}: encoding differs from Go");
+                    let mut d = FrameDecoder::default();
+                    // Feed byte by byte to exercise reassembly.
+                    for b in &buf {
+                        assert_eq!(d.next_frame(), Ok(None), "{name}: early frame");
+                        d.push(&[*b]);
+                    }
+                    assert_eq!(d.next_frame(), Ok(Some(msg)), "{name}: round trip");
+                    assert_eq!(d.next_frame(), Ok(None));
+                }
             }
         }
     }
 
     #[test]
     fn tampering_is_detected() {
-        let (_, packet, dir) = &vectors()[6];
-        let dir = dir.unwrap();
-        let mut buf = packet.encode(Some((&KEY, dir))).unwrap();
+        let packet = Packet {
+            id: SESSION,
+            seq: 1,
+            msg: Message::Check {
+                txid: 1,
+                nominate: false,
+            },
+        };
+        let mut buf = packet.encode(&KEY, Dir::HostToJoiner).unwrap();
         assert!(
             !verify(&buf, &KEY, Dir::JoinerToHost),
             "direction must matter"
         );
         *buf.last_mut().unwrap() ^= 1;
-        assert!(!verify(&buf, &KEY, dir));
+        assert!(!verify(&buf, &KEY, Dir::HostToJoiner));
+    }
+
+    #[test]
+    fn transports_are_separate() {
+        let reg = Message::Register {
+            host: false,
+            candidates: vec![],
+        };
+        let as_packet = Packet {
+            id: 0,
+            seq: 0,
+            msg: reg,
+        };
+        assert!(as_packet.encode(&KEY, Dir::ClientToServer).is_err());
+        assert!(encode_frame(&Message::Bind).is_err());
+        let mut d = FrameDecoder::default();
+        d.push(&[0, 10, TYPE_CHECK, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(d.next_frame(), Err(ProtocolError::UnknownType(TYPE_CHECK)));
     }
 
     #[test]
@@ -773,10 +884,6 @@ mod tests {
             h
         };
         let with = |ty: u8, payload: &[u8]| [hdr(ty), payload.to_vec()].concat();
-        let register = vectors()[0].1.encode(None).unwrap();
-        let mut dirty = register.clone();
-        *dirty.last_mut().unwrap() = 1;
-
         let cases: Vec<(&str, Vec<u8>, ProtocolError)> = vec![
             ("short header", hdr(TYPE_CHECK)[..31].to_vec(), Short),
             (
@@ -786,25 +893,18 @@ mod tests {
             ),
             (
                 "bad version",
-                [b"KK\x01".as_slice(), &hdr(TYPE_CHECK)[3..]].concat(),
-                BadVersion(1),
+                [b"KK\x02".as_slice(), &hdr(TYPE_CHECK)[3..]].concat(),
+                BadVersion(2),
             ),
             ("unknown type", hdr(0x7f), UnknownType(0x7f)),
+            (
+                "frame-only type",
+                hdr(TYPE_REGISTER),
+                UnknownType(TYPE_REGISTER),
+            ),
             ("short payload", with(TYPE_CHECK, &[1, 2, 3]), Short),
             ("trailing", with(TYPE_CLOSE, &[0, 0]), Trailing),
-            (
-                "register unpadded",
-                register[..register.len() - 1].to_vec(),
-                Short,
-            ),
-            ("register dirty padding", dirty, Trailing),
-            ("zero join", with(TYPE_JOIN, &[0; 6]), BadField),
-            ("bad lobby char", with(TYPE_JOIN, b"K7M2QO"), BadField),
-            (
-                "bad role",
-                with(TYPE_PEER_INFO, &[0, 0, 0, 0, 0, 0, 0, 0, 9]),
-                BadField,
-            ),
+            ("bind with payload", with(TYPE_BIND, &[0]), Trailing),
             (
                 "data too long",
                 with(TYPE_DATA, &[0; MAX_DATA_LEN + 1]),
@@ -814,6 +914,31 @@ mod tests {
         for (name, input, want) in cases {
             assert_eq!(Packet::decode(&input), Err(want), "{name}");
         }
+
+        let frame = |body: &[u8]| {
+            let mut d = FrameDecoder::default();
+            d.push(&(body.len() as u16).to_be_bytes());
+            d.push(body);
+            d.next_frame()
+        };
+        assert_eq!(
+            frame(&[TYPE_JOIN, 0, 0, 0, 0, 0, 0]),
+            Err(BadField),
+            "zero join"
+        );
+        assert_eq!(
+            frame(&[TYPE_JOIN, b'K', b'7', b'M', b'2', b'Q', b'O']),
+            Err(BadField)
+        );
+        assert_eq!(
+            frame(&[TYPE_PEER_INFO, 0, 0, 0, 0, 0, 0, 0, 0, 9]),
+            Err(BadField),
+            "bad role"
+        );
+        assert_eq!(frame(&[TYPE_STATS, MAX_STATS as u8 + 1]), Err(BadField));
+        let mut d = FrameDecoder::default();
+        d.push(&[0x20, 0x00]);
+        assert_eq!(d.next_frame(), Err(BadField), "oversized frame");
     }
 
     #[test]

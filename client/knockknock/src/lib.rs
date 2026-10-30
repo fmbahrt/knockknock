@@ -5,8 +5,9 @@
 //! See `docs/design.md` for the design and `docs/protocol.md` for the wire
 //! format.
 //!
-//! [`Client`] is a ready-to-use driver over a `std::net::UdpSocket`. For
-//! custom I/O (e.g. a game engine's loop), drive an [`Agent`] directly.
+//! [`Client`] is a ready-to-use driver: TLS signalling over TCP plus a
+//! `std::net::UdpSocket` for the game. For custom I/O (e.g. a game engine's
+//! loop), drive an [`Agent`] directly.
 
 mod agent;
 mod auth;
@@ -23,7 +24,7 @@ use std::time::Duration;
 use std::{fmt, io};
 
 pub use agent::{Agent, Event, Mode, Output, SessionId};
-pub use client::Client;
+pub use client::{Client, ServerTrust};
 pub use pair::PairState;
 pub use protocol::{ErrorCode, LobbyId, ProtocolError};
 pub use session::{FailReason, State};
@@ -54,9 +55,12 @@ pub struct Config {
     pub ping_interval: Option<Duration>,
     /// How often a host reports its sessions' stats to the server.
     pub stats_interval: Duration,
+    /// How often the signalling connection sends a heartbeat. The server
+    /// drops connections that are silent for 90 s.
+    pub heartbeat_interval: Duration,
     /// Maximum number of pairs in `Checking` at once.
     pub max_concurrent_checks: usize,
-    /// How often unanswered requests to the rendezvous server are resent.
+    /// How often an unconfirmed BIND is resent.
     pub server_retry: Duration,
     /// Granularity of the internal timers.
     pub tick_interval: Duration,
@@ -75,6 +79,7 @@ impl Default for Config {
             recovery_timeout: Duration::from_secs(10),
             ping_interval: Some(Duration::from_secs(1)),
             stats_interval: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(30),
             max_concurrent_checks: 8,
             server_retry: Duration::from_millis(500),
             tick_interval: Duration::from_millis(50),
@@ -86,6 +91,9 @@ impl Default for Config {
 pub enum Error {
     Io(io::Error),
     Protocol(ProtocolError),
+    /// The TLS connection to the rendezvous server failed, e.g. because its
+    /// certificate is not trusted.
+    Tls(rustls::Error),
     /// The rendezvous server rejected the request.
     Server(ErrorCode),
     Timeout,
@@ -99,6 +107,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Protocol(e) => write!(f, "protocol: {e}"),
+            Self::Tls(e) => write!(f, "tls: {e}"),
             Self::Server(code) => write!(f, "server: {code}"),
             Self::Timeout => f.write_str("timed out"),
             Self::NotConnected => f.write_str("session is not connected"),
@@ -112,6 +121,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(e) => Some(e),
             Self::Protocol(e) => Some(e),
+            Self::Tls(e) => Some(e),
             _ => None,
         }
     }
@@ -120,6 +130,12 @@ impl std::error::Error for Error {
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<rustls::Error> for Error {
+    fn from(e: rustls::Error) -> Self {
+        Self::Tls(e)
     }
 }
 

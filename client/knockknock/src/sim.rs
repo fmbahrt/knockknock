@@ -585,7 +585,7 @@ fn rejects_forged_reflected_and_replayed_checks() {
                 nominate: false,
             },
         }
-        .encode(Some((key, dir)))
+        .encode(key, dir)
         .unwrap()
     };
     let mut deliver = |raw: Vec<u8>| -> usize {

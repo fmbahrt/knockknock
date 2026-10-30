@@ -6,9 +6,9 @@ bin := "../bin/rendezvous"
 build:
     go build -o {{ bin }} ./cmd/rendezvous
 
-# Run the server
+# Run the server (writes its dev CA to bin/dev-ca.pem unless given -tls-cert/-tls-key)
 run *args:
-    go run ./cmd/rendezvous {{ args }}
+    go run ./cmd/rendezvous -tls-dev-ca ../bin/dev-ca.pem {{ args }}
 
 # Run tests
 test:

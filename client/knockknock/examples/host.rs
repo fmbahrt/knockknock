@@ -5,11 +5,10 @@
 //! Exits after `players` joiners have said hello (default: run forever).
 
 use std::env;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use knockknock::{Client, Event, SessionId, State};
+use knockknock::{Client, Event, ServerTrust, SessionId, State};
 
 const STATS_EVERY: Duration = Duration::from_secs(5);
 
@@ -38,11 +37,7 @@ fn usage() -> ExitCode {
 }
 
 fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
-    let server: SocketAddr = server
-        .to_socket_addrs()?
-        .next()
-        .ok_or("server address did not resolve")?;
-    let mut client = Client::host(server)?;
+    let mut client = Client::host(server, trust()?)?;
     let mut greeted = 0;
     let mut sessions: Vec<SessionId> = Vec::new();
     let mut next_stats = Instant::now() + STATS_EVERY;
@@ -79,6 +74,7 @@ fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::E
                 greeted += 1;
             }
             Some(Event::ServerError(code)) => eprintln!("[host] server error: {code}"),
+            Some(Event::ServerLost) => eprintln!("[host] lost the rendezvous server"),
             Some(Event::Registered { .. }) | None => {}
         }
 
@@ -101,4 +97,13 @@ fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::E
     }
     client.close()?;
     Ok(())
+}
+
+/// Trusts the CA in `$KNOCKKNOCK_CA` (e.g. the server's generated dev CA), or
+/// the public Web PKI roots if it is unset.
+fn trust() -> std::io::Result<ServerTrust> {
+    match std::env::var_os("KNOCKKNOCK_CA") {
+        Some(path) => ServerTrust::ca_file(path),
+        None => Ok(ServerTrust::PublicRoots),
+    }
 }
