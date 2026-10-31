@@ -93,16 +93,23 @@ godot:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --manifest-path client/Cargo.toml -p knockknock-godot
+    # Names must match godot/addons/knockknock/knockknock.gdextension.
     case "$(uname -s)" in
-      Darwin) lib=libknockknock_godot.dylib ;;
-      MINGW*|MSYS*|CYGWIN*) lib=knockknock_godot.dll ;;
-      *) lib=libknockknock_godot.so ;;
+      Darwin) lib=libknockknock_godot.dylib; out=$lib ;;
+      MINGW*|MSYS*|CYGWIN*) lib=knockknock_godot.dll; out=$lib ;;
+      *)
+        lib=libknockknock_godot.so
+        case "$(uname -m)" in
+          aarch64|arm64) out=libknockknock_godot.linux.arm64.so ;;
+          *) out=libknockknock_godot.linux.x86_64.so ;;
+        esac
+        ;;
     esac
     mkdir -p godot/addons/knockknock/bin
     # Replace, don't overwrite: an open editor has the old library mapped, and
     # macOS kills processes whose mapped code changes in place.
-    cp "client/target/debug/$lib" "godot/addons/knockknock/bin/.$lib.tmp"
-    mv -f "godot/addons/knockknock/bin/.$lib.tmp" "godot/addons/knockknock/bin/$lib"
+    cp "client/target/debug/$lib" "godot/addons/knockknock/bin/.$out.tmp"
+    mv -f "godot/addons/knockknock/bin/.$out.tmp" "godot/addons/knockknock/bin/$out"
     # Trust the dev CA from `just rendezvous::run`, if there is one.
     if [ -f bin/dev-ca.pem ]; then cp bin/dev-ca.pem godot/dev-ca.pem; fi
 
