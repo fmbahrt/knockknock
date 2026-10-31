@@ -31,7 +31,7 @@ or a CA the game ships (the server can generate a development CA).
 
 | Type | Name | Dir | Body |
 |---|---|---|---|
-| `0x01` | `REGISTER` | C→S | `flags u8` (bit 0 = `HOST`), `Candidates` (host candidates). Must be the first frame, sent once. |
+| `0x01` | `REGISTER` | C→S | `flags u8` (bit 0 = `HOST`, bit 1 = `RESUME`), `Candidates` (host candidates), then, if `RESUME`, `client_id u64` and `client_secret Key`. Must be the first frame, sent once. |
 | `0x02` | `REGISTERED` | S→C | `client_id u64`, `client_secret Key`, `lid LobbyId` (zero unless host), `bind_secs u16` |
 | `0x03` | `JOIN` | C→S | `lid LobbyId` (non-zero). Allowed once the client is bound. |
 | `0x04` | `PEER_INFO` | S→C | `session_id u64`, `role u8` (`1` controlling/host, `2` controlled/joiner), `session_key Key`, `Candidates` (the other peer's) |
@@ -42,8 +42,14 @@ or a CA the game ships (the server can generate a development CA).
 | `0x12` | `PING` | both | `id u32`. Clients send one every 30 s as a heartbeat (the server drops connections silent for 90 s). The server sends one every 10 s to measure signalling latency. |
 | `0x13` | `PONG` | both | `id u32` (echoed); every `PING` is answered |
 
-A client lives as long as its connection does. When it closes, its lobby, or
-its seat in one, goes with it.
+A client that sends `CLOSE` is removed at once, together with its lobby or its
+seat in one. If the connection just drops, the server keeps the client
+(lobby, sessions, binding) for a grace period (60 s). A `REGISTER` with
+`RESUME` and the right ID and secret takes it back: `REGISTERED` repeats the
+same ID, secret and lobby, followed by `BOUND` if the client was bound. If the
+old connection still looks alive, the new one replaces it. An unknown or
+expired ID, or a wrong secret, gets a fresh registration. Joins to a lobby
+whose host is detached get `LOBBY_NOT_FOUND`.
 
 ### Error codes
 

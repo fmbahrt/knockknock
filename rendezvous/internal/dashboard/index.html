@@ -150,6 +150,10 @@ function badge(text, cls, title) {
 
 function clientFlags(c) {
   const flags = [];
+  if (c.detached) {
+    flags.push(badge("reconnecting " + duration(c.detached), "warn",
+      "the signalling connection dropped; its lobby and seat are kept while it reconnects"));
+  }
   if (!c.bound) {
     flags.push(c.connected >= UNBOUND_SUSPECT_S
       ? badge("no UDP for " + duration(c.connected), "bad", "BIND never arrived: UDP is probably blocked on this network")
@@ -214,6 +218,9 @@ function countersGrid(snap) {
       ...fromMap(c.bindsRejected, ["bad mac", "replay", "unknown client", "malformed"]).map(([k, v]) => ["rejected: " + k, v]),
     ]),
     kv("Disconnects", fromMap(c.disconnects, ["left", "connection closed", "idle timeout", "slow client", "protocol error", "bad request"])),
+    kv("Reconnects", [
+      ["resumed", c.resumed], ["gave up (grace expired)", c.resumeExpired], ["resume refused", c.resumeFailed],
+    ]),
     kv("Client lifetimes", lifetime(snap.lifetimes.clients)),
     kv("Lobby lifetimes", lifetime(snap.lifetimes.lobbies)),
   ];

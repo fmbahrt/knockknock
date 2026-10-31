@@ -66,6 +66,8 @@ func vectors() []vector {
 
 		frame("frame_register", &Register{Host: true,
 			Candidates: []Candidate{{KindHost, netip.MustParseAddrPort("192.168.1.20:5000")}}}),
+		frame("frame_register_resume", &Register{Candidates: []Candidate{{KindHost, netip.MustParseAddrPort("192.168.1.20:5000")}},
+			ResumeID: client, ResumeSecret: testKey}),
 		frame("frame_registered", &Registered{ClientID: client, Secret: testKey, Lobby: lobby, BindSecs: 15}),
 		frame("frame_join", &Join{Lobby: lobby}),
 		frame("frame_peer_info", &PeerInfo{SessionID: session, Role: RoleControlling, Key: testKey,

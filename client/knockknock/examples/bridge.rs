@@ -153,6 +153,10 @@ fn print_event(
         Event::Data { session, data } => writeln!(out, "data {session:016x} {}", encode_hex(data))?,
         Event::ServerError(code) => writeln!(out, "error server: {code}")?,
         Event::ServerLost => writeln!(out, "error server connection lost")?,
+        Event::ServerRestored { lobby } => {
+            let lobby = lobby.map_or("-".into(), |l| l.to_string());
+            writeln!(out, "restored {lobby}")?;
+        }
     }
     Ok(())
 }

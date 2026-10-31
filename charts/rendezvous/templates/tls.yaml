@@ -1,0 +1,60 @@
+{{- if eq .Values.tls.mode "selfSigned" }}
+{{- $name := include "rendezvous.tlsSecretName" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $ca := dict }}
+{{- if and $existing (index $existing.data "ca.crt") (index $existing.data "ca.key") }}
+{{- /* Keep the CA across upgrades: games ship it. */}}
+{{- $ca = buildCustomCert (index $existing.data "ca.crt") (index $existing.data "ca.key") }}
+{{- else }}
+{{- $ca = genCA "knockknock rendezvous CA" (int .Values.tls.selfSigned.caDays) }}
+{{- end }}
+{{- $ips := list }}
+{{- $dns := list }}
+{{- range .Values.tls.selfSigned.hosts }}
+{{- if or (regexMatch "^[0-9.]+$" .) (contains ":" .) }}
+{{- $ips = append $ips . }}
+{{- else }}
+{{- $dns = append $dns . }}
+{{- end }}
+{{- end }}
+{{- $cn := default "knockknock rendezvous" (first $dns) }}
+{{- $cert := genSignedCert $cn $ips $dns (int .Values.tls.selfSigned.days) $ca }}
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/tls
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+  annotations:
+    # Uninstalling must not throw away the CA your game ships.
+    helm.sh/resource-policy: keep
+data:
+  ca.crt: {{ $ca.Cert | b64enc }}
+  ca.key: {{ $ca.Key | b64enc }}
+  tls.crt: {{ $cert.Cert | b64enc }}
+  tls.key: {{ $cert.Key | b64enc }}
+{{- else if eq .Values.tls.mode "certManager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "rendezvous.fullname" . }}
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "rendezvous.tlsSecretName" . }}
+  issuerRef:
+    name: {{ required "tls.certManager.issuerRef.name is required" .Values.tls.certManager.issuerRef.name }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+    group: {{ .Values.tls.certManager.issuerRef.group }}
+  dnsNames:
+    {{- required "tls.certManager.dnsNames is required" .Values.tls.certManager.dnsNames | toYaml | nindent 4 }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+{{- else if ne .Values.tls.mode "secret" }}
+{{- fail "tls.mode must be selfSigned, certManager or secret" }}
+{{- end }}

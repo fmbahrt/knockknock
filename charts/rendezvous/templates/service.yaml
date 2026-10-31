@@ -1,0 +1,63 @@
+{{- $type := include "rendezvous.serviceType" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rendezvous.fullname" . }}
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $type }}
+  {{- if ne $type "ClusterIP" }}
+  # Keeps client source addresses, which the server hands to peers.
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- if eq $type "LoadBalancer" }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "rendezvous.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- range list "TCP" "UDP" }}
+    - name: signal-{{ lower . }}
+      protocol: {{ . }}
+      port: {{ $.Values.server.port }}
+      targetPort: signal-{{ lower . }}
+      {{- if and (ne $type "ClusterIP") $.Values.service.nodePort }}
+      nodePort: {{ $.Values.service.nodePort }}
+      {{- end }}
+    {{- end }}
+{{- if .Values.dashboard.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rendezvous.fullname" . }}-dashboard
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "rendezvous.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.dashboard.port }}
+      targetPort: dashboard
+{{- end }}

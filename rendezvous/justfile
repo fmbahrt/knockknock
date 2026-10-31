@@ -10,6 +10,10 @@ build:
 run *args:
     go run ./cmd/rendezvous -tls-dev-ca ../bin/dev-ca.pem {{ args }}
 
+# Build the container image: just rendezvous::image [version] [repository]
+image version="dev" repository="knockknock/rendezvous":
+    docker build --build-arg VERSION={{ version }} -t {{ repository }}:{{ version }} .
+
 # Run tests
 test:
     go test -race ./...

@@ -1,0 +1,147 @@
+# knockknock rendezvous server.
+#
+# Read this first: hole punching only works if the server sees each client's
+# real public IP and port. Anything that rewrites the source address of the
+# UDP BIND packets (a proxying load balancer, most Gateway implementations,
+# kube-proxy SNAT) hands peers the wrong endpoint and every join fails with
+# NoPath. The default (a LoadBalancer Service with
+# externalTrafficPolicy: Local) preserves it on most clouds. Check the
+# dashboard's "TLS≠UDP" flag and the public endpoint clients print.
+
+image:
+  repository: knockknock/rendezvous
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # Pin by digest (sha256:…) in production; overrides tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+server:
+  # TLS signalling (TCP) and BIND (UDP) share this port number. Clients reach
+  # both at the same address, so the public port must be the same for both
+  # protocols too.
+  port: 7777
+  # Maximum peers per lobby, host included.
+  maxLobby: 8
+  # Sustained new connections/joins per second per client IP, and burst.
+  rate: 5
+  burst: 20
+  debug: false
+  extraArgs: []
+
+tls:
+  # selfSigned: the chart generates a CA and a server certificate. The CA is
+  #   kept across upgrades; ship it with your game (the Secret's ca.crt):
+  #   kubectl get secret <release>-rendezvous-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > dev-ca.pem
+  # certManager: a cert-manager Certificate (e.g. Let's Encrypt); clients
+  #   then use the public roots and need no CA file.
+  # secret: an existing kubernetes.io/tls Secret you manage.
+  # The server re-reads the certificate every minute, so renewals need no restart.
+  mode: selfSigned
+  selfSigned:
+    # Names and IPs clients connect to. Required for anything but local tests.
+    hosts: [localhost, 127.0.0.1]
+    caDays: 3650
+    # The server certificate is reissued (same CA) on every helm upgrade.
+    days: 365
+  certManager:
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    dnsNames: []
+    duration: 2160h
+    renewBefore: 720h
+  secret:
+    name: ""
+
+service:
+  # Defaults to LoadBalancer, or ClusterIP when gateway.enabled.
+  type: ""
+  # Local preserves client source addresses (required, see the top of this file).
+  externalTrafficPolicy: Local
+  # Used for both protocols when type is NodePort/LoadBalancer; empty = random.
+  nodePort: null
+  loadBalancerClass: ""
+  loadBalancerSourceRanges: []
+  ipFamilyPolicy: ""
+  ipFamilies: []
+  annotations: {}
+
+# The stats dashboard shows lobby codes, which let anyone join. It is off by
+# default; when on, it is only reachable through its ClusterIP Service (e.g.
+# kubectl port-forward) unless you add an HTTPRoute (put authentication in
+# front of it) and allow the gateway in networkPolicy.dashboardFrom.
+dashboard:
+  enabled: false
+  port: 8080
+  httpRoute:
+    enabled: false
+    annotations: {}
+    parentRefs: []
+    hostnames: []
+
+# Gateway API. TCPRoute, UDPRoute and TLSRoute are in the experimental
+# channel; install its CRDs and use an implementation that supports them.
+# WARNING: implementations that proxy UDP (Envoy Gateway and most others)
+# replace the client's source address with their own, which breaks hole
+# punching. Use only an implementation that preserves client addresses for
+# UDP, or keep the default LoadBalancer Service.
+gateway:
+  enabled: false
+  # Create a Gateway with a TCP (or TLS passthrough) and a UDP listener on
+  # server.port. Otherwise attach the routes to parentRefs below.
+  create: false
+  className: ""
+  annotations: {}
+  addresses: []
+  # TCPRoute, or TLSRoute (TLS passthrough, routed by SNI to hostnames).
+  signallingRoute: TCPRoute
+  hostnames: []
+  parentRefs:
+    # Existing Gateway listeners, used when create is false.
+    tcp: []
+    udp: []
+  apiVersions:
+    gateway: gateway.networking.k8s.io/v1
+    httpRoute: gateway.networking.k8s.io/v1
+    tcpRoute: gateway.networking.k8s.io/v1alpha2
+    udpRoute: gateway.networking.k8s.io/v1alpha2
+    tlsRoute: gateway.networking.k8s.io/v1alpha2
+
+networkPolicy:
+  enabled: true
+  # Who may reach the signalling port (TCP and UDP). Empty = everyone.
+  signallingFrom: []
+  # Who may reach the dashboard. Empty = nobody (kubectl port-forward still works).
+  dashboardFrom: []
+  # All egress is denied: the server only answers connections and never sends UDP.
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Lobbies live in memory, so the server runs as exactly one replica (two
+# would split players between them) and is replaced with Recreate.
+# Clients reconnect on their own; hosts get a new lobby code after a restart.
+terminationGracePeriodSeconds: 30
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    # Also passed to the Go runtime as GOMEMLIMIT.
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -16,6 +16,7 @@ const (
 	reasonSlow       = "slow client"
 	reasonWrite      = "write error"
 	reasonShutdown   = "server shutdown"
+	reasonReplaced   = "replaced by resume"
 	reasonError      = "connection error"
 )
 
@@ -49,6 +50,9 @@ type Counters struct {
 	BindsRejected     map[string]int `json:"bindsRejected"`
 	Rebinds           int            `json:"rebinds"`
 	Disconnects       map[string]int `json:"disconnects"`
+	Resumed           int            `json:"resumed"`       // reconnected and took back their lobby/session
+	ResumeFailed      int            `json:"resumeFailed"`  // asked to resume an unknown or expired client
+	ResumeExpired     int            `json:"resumeExpired"` // dropped and never came back within the grace period
 }
 
 func newCounters() Counters {

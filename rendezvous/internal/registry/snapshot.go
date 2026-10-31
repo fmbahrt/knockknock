@@ -39,6 +39,7 @@ type ClientSnapshot struct {
 	Rebinds      int      `json:"rebinds"`
 	Connected    Duration `json:"connected"`
 	LastBind     Duration `json:"lastBind,omitempty"` // seconds ago
+	Detached     Duration `json:"detached,omitempty"` // seconds since its connection dropped, while it may still resume
 	ServerRTTMs  *float64 `json:"serverRttMs,omitempty"`
 }
 
@@ -144,6 +145,9 @@ func clientSnapshot(c *client, now time.Time) ClientSnapshot {
 	if c.bound() {
 		cs.AddrMismatch = c.observed.Addr() != c.ip
 		cs.LastBind = seconds(now.Sub(c.lastBind))
+	}
+	if c.detached() {
+		cs.Detached = seconds(now.Sub(c.detachedAt))
 	}
 	if c.srtt > 0 {
 		cs.ServerRTTMs = ptr(float64(c.srtt.Microseconds()) / 1000)

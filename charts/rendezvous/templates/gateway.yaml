@@ -1,0 +1,117 @@
+{{- if .Values.gateway.enabled }}
+{{- $g := .Values.gateway }}
+{{- $tls := eq $g.signallingRoute "TLSRoute" }}
+{{- if not (has $g.signallingRoute (list "TCPRoute" "TLSRoute")) }}
+{{- fail "gateway.signallingRoute must be TCPRoute or TLSRoute" }}
+{{- end }}
+{{- if and $tls (not $g.hostnames) }}
+{{- fail "gateway.hostnames is required for TLSRoute (it routes by SNI)" }}
+{{- end }}
+{{- $tcpParents := $g.parentRefs.tcp }}
+{{- $udpParents := $g.parentRefs.udp }}
+{{- if $g.create }}
+{{- $tcpParents = list (dict "name" (include "rendezvous.gatewayName" .) "sectionName" "signal-tcp") }}
+{{- $udpParents = list (dict "name" (include "rendezvous.gatewayName" .) "sectionName" "signal-udp") }}
+apiVersion: {{ $g.apiVersions.gateway }}
+kind: Gateway
+metadata:
+  name: {{ include "rendezvous.gatewayName" . }}
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+  {{- with $g.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ required "gateway.className is required when gateway.create" $g.className }}
+  {{- with $g.addresses }}
+  addresses:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  listeners:
+    - name: signal-tcp
+      port: {{ .Values.server.port }}
+      {{- if $tls }}
+      protocol: TLS
+      tls:
+        mode: Passthrough
+      {{- else }}
+      protocol: TCP
+      {{- end }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+        kinds:
+          - kind: {{ $g.signallingRoute }}
+    - name: signal-udp
+      port: {{ .Values.server.port }}
+      protocol: UDP
+      allowedRoutes:
+        namespaces:
+          from: Same
+        kinds:
+          - kind: UDPRoute
+---
+{{- end }}
+{{- if not $tcpParents }}
+{{- fail "gateway.parentRefs.tcp is required unless gateway.create" }}
+{{- end }}
+{{- if not $udpParents }}
+{{- fail "gateway.parentRefs.udp is required unless gateway.create" }}
+{{- end }}
+apiVersion: {{ ternary $g.apiVersions.tlsRoute $g.apiVersions.tcpRoute $tls }}
+kind: {{ $g.signallingRoute }}
+metadata:
+  name: {{ include "rendezvous.fullname" . }}-signal
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $tcpParents | nindent 4 }}
+  {{- if $tls }}
+  hostnames:
+    {{- toYaml $g.hostnames | nindent 4 }}
+  {{- end }}
+  rules:
+    - backendRefs:
+        - name: {{ include "rendezvous.fullname" . }}
+          port: {{ .Values.server.port }}
+---
+apiVersion: {{ $g.apiVersions.udpRoute }}
+kind: UDPRoute
+metadata:
+  name: {{ include "rendezvous.fullname" . }}-bind
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $udpParents | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ include "rendezvous.fullname" . }}
+          port: {{ .Values.server.port }}
+{{- end }}
+{{- if and .Values.dashboard.enabled .Values.dashboard.httpRoute.enabled }}
+---
+apiVersion: {{ .Values.gateway.apiVersions.httpRoute }}
+kind: HTTPRoute
+metadata:
+  name: {{ include "rendezvous.fullname" . }}-dashboard
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+  {{- with .Values.dashboard.httpRoute.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- required "dashboard.httpRoute.parentRefs is required" .Values.dashboard.httpRoute.parentRefs | toYaml | nindent 4 }}
+  {{- with .Values.dashboard.httpRoute.hostnames }}
+  hostnames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - backendRefs:
+        - name: {{ include "rendezvous.fullname" . }}-dashboard
+          port: {{ .Values.dashboard.port }}
+{{- end }}

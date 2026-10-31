@@ -74,7 +74,11 @@ fn run(server: &str, players: Option<usize>) -> Result<(), Box<dyn std::error::E
                 greeted += 1;
             }
             Some(Event::ServerError(code)) => eprintln!("[host] server error: {code}"),
-            Some(Event::ServerLost) => eprintln!("[host] lost the rendezvous server"),
+            Some(Event::ServerLost) => eprintln!("[host] lost the rendezvous server; reconnecting"),
+            Some(Event::ServerRestored { lobby }) => match lobby {
+                Some(lobby) => println!("[host] back on the rendezvous server, lobby {lobby}"),
+                None => println!("[host] back on the rendezvous server"),
+            },
             Some(Event::Registered { .. }) | None => {}
         }
 

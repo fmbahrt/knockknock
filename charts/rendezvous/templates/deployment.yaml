@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rendezvous.fullname" . }}
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+spec:
+  # Lobbies are in-memory state: exactly one replica, never two at once.
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "rendezvous.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rendezvous.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "rendezvous.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      # Pod Security Standards "restricted", plus a read-only root filesystem.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rendezvous
+          image: {{ include "rendezvous.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -addr=:{{ .Values.server.port }}
+            - -health=:8081
+            - -http={{ if .Values.dashboard.enabled }}:{{ .Values.dashboard.port }}{{ end }}
+            - -tls-cert=/etc/rendezvous/tls/tls.crt
+            - -tls-key=/etc/rendezvous/tls/tls.key
+            - -max-lobby={{ .Values.server.maxLobby }}
+            - -rate={{ .Values.server.rate }}
+            - -burst={{ .Values.server.burst }}
+            {{- if .Values.server.debug }}
+            - -debug
+            {{- end }}
+            {{- range .Values.server.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if (.Values.resources.limits).memory }}
+          env:
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+          {{- end }}
+          ports:
+            - name: signal-tcp
+              containerPort: {{ .Values.server.port }}
+              protocol: TCP
+            - name: signal-udp
+              containerPort: {{ .Values.server.port }}
+              protocol: UDP
+            {{- if .Values.dashboard.enabled }}
+            - name: dashboard
+              containerPort: {{ .Values.dashboard.port }}
+              protocol: TCP
+            {{- end }}
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: [ALL]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/rendezvous/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "rendezvous.tlsSecretName" . }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

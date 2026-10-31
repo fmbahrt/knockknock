@@ -33,7 +33,9 @@ func _ready() -> void:
 	Knockknock.joiner_failed.connect(func(session, reason): _say("Could not reach session %s: %s" % [session, reason]))
 	Knockknock.join_ready.connect(_on_join_ready)
 	Knockknock.join_failed.connect(_on_join_failed)
-	Knockknock.server_lost.connect(func(): _say("Lost the rendezvous server (the game keeps running)"))
+	Knockknock.server_lost.connect(func(): _say("Lost the rendezvous server; reconnecting (the game keeps running)"))
+	Knockknock.server_restored.connect(func(): _say("Back on the rendezvous server"))
+	Knockknock.lobby_changed.connect(_on_lobby_changed)
 	Knockknock.error.connect(func(message): _say("Error: " + message))
 
 	multiplayer.peer_connected.connect(_on_peer_connected)
@@ -74,6 +76,15 @@ func _on_lobby_opened(lobby_id: String, local_port: int) -> void:
 	_say("Lobby %s is open; share the code." % lobby_id)
 	if _headless:
 		print("LOBBY ", lobby_id)
+
+
+func _on_lobby_changed(lobby_id: String) -> void:
+	# The server forgot the old lobby (e.g. it restarted); players already
+	# here are unaffected, new ones need the new code.
+	if _code:
+		_code.text = lobby_id
+	_set_status("Hosting lobby %s" % lobby_id)
+	_say("The lobby code changed to %s; share the new one." % lobby_id)
 
 
 func _join(server: String, lobby_id: String) -> void:

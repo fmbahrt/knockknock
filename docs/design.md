@@ -8,7 +8,8 @@ both sit behind NAT routers. It follows
 [protocol.md](protocol.md).
 
 This document revises the original v0.1 sketch. Section 9 lists what changed
-and why.
+and why. Section 18 covers the repository layout, building, testing and using
+the library.
 
 ## 1. Goals
 
@@ -287,6 +288,8 @@ capabilities (§8). Keep it on localhost or behind authentication.
 | BIND retry until confirmed | 500 ms |
 | BIND refresh (`bind_secs`, server) | 15 s |
 | signalling heartbeat | 30 s (the server drops silent connections after 90 s) |
+| reconnect backoff | 1 s, doubling to 30 s |
+| resume grace (server) | 60 s |
 
 NAT mapping lifetimes vary, often as low as 20–30 s for UDP. That is why these
 are settings, not constants.
@@ -301,8 +304,15 @@ are settings, not constants.
   outer NAT to hairpin (paper §3.5).
 - Single host candidate (primary interface) only.
 - No relay and no NAT probe yet.
-- Losing the signalling connection does not end established sessions, but the
-  client does not reconnect automatically yet.
+- If the server itself restarts, its in-memory state is gone: reconnecting
+  clients register afresh and hosts get a new lobby code (`lobby_changed` in
+  Godot). Established games are unaffected.
+- A joiner behind a symmetric NAT cannot reach a send-only (Godot) host
+  (§15). Relay is the fix.
+- With gdext 0.5.5 and Godot 4.7.2, the headless editor crashes on exit after
+  a project's very first import. It reproduces with an empty gdext extension,
+  so it is upstream. Later imports and game runs are unaffected, and
+  `just godot-smoke` retries.
 
 ## 14. Signalling over TCP/TLS
 
@@ -368,6 +378,24 @@ TCP channel.
 - **Heartbeats remain.** A TCP heartbeat (every 30 s here) is plenty (NATs keep
   established TCP mappings far longer than UDP ones; RFC 5382 recommends at
   least 2 h 4 min). The UDP `BIND` refresh is still needed for the UDP mapping.
+
+### Reconnecting
+
+Losing the signalling connection never ends a game: peer↔peer sessions and
+ENet keep running. The agent keeps its registration and asks the driver to
+reconnect with backoff (`reconnect_due`, `signal_reconnected`,
+`reconnect_failed`).
+- **Resume:** it re-registers with `RESUME` and its client ID and secret.
+  The server holds a dropped client's lobby, sessions and binding for 60 s,
+  hands them back, and replaces the old connection if it had not noticed it
+  die.
+- **Too late:** after the grace period the client registers afresh, and a
+  host gets a new lobby code.
+- **Drivers:** the std `Client` reconnects inline (blocking for up to the
+  connect timeout). The Godot extension dials on a background thread, as it
+  does for the first connect, so `_process` never blocks.
+- **Dashboard:** it shows detached clients as "reconnecting" and counts
+  resumes.
 
 ### What does not need encryption
 
@@ -451,7 +479,8 @@ names below are as built:
 `lobby_opened(lobby_id, local_port)`, `joiner_incoming(session)`,
 `joiner_connected(session, address)`, `joiner_failed(session, reason)`,
 `join_ready(address, port, join_token)`, `join_failed(reason)`, `server_lost`,
-`error(message)`.
+`server_restored`, `lobby_changed(lobby_id)`, `error(message)`. §18 has a
+usage example.
 
 The original sketch follows; the as-built API differs in the details noted
 after it.
@@ -581,3 +610,209 @@ dashboard and log.
     both-ends view, timelines, aggregates, JSONL log
 11. Relay through the rendezvous server (the `NoPath` fallback)
 12. Hardening: NAT probe, fuzzing, multi-interface
+
+## 18. Repository and usage
+
+- **`rendezvous/`**: the rendezvous server, in Go (standard library only).
+- **`client/`**: the peer library, in Rust (`rustls` + `ring` + `webpki-roots`).
+- **`client/knockknock-godot/`** + **`godot/`**: the Godot 4.7 GDExtension and an
+  example project.
+- **`docs/protocol.md`**: the wire format, plus shared test vectors in `docs/testdata/`.
+
+### Layout
+
+```
+.
+├── mise.toml                 # pinned Go, Rust, Python, Godot and just versions
+├── justfile                  # top-level tasks; delegates to the modules below
+├── docs/
+│   ├── design.md             # design spec
+│   ├── protocol.md           # wire format (source of truth)
+│   └── testdata/vectors.txt  # encoded packets both languages must match
+├── charts/rendezvous/        # Helm chart for the server
+├── rendezvous/               # Go module: knockknock/rendezvous
+│   ├── Dockerfile            # distroless, non-root image
+│   ├── cmd/rendezvous/       # binary entry point
+│   └── internal/
+│       ├── protocol/         # packet encoding/decoding, lobby IDs
+│       ├── auth/             # HMAC tags, replay window
+│       ├── devcert/          # development CA + certificate generation
+│       ├── ratelimit/        # per-IP token bucket
+│       ├── registry/         # clients, lobbies, sessions, stats snapshot
+│       └── dashboard/        # web view of lobbies and connection stats
+├── godot/                    # example Godot project
+│   ├── main.gd               # host/join UI + chat; headless smoke test mode
+│   └── addons/knockknock/    # the addon: .gdextension, plugin, Knockknock autoload
+└── client/                   # Cargo workspace
+    ├── knockknock-godot/     # GDExtension (gdext) wrapping the library
+    └── knockknock/           # library crate
+        ├── src/protocol.rs   # packet encoding/decoding
+        ├── src/auth.rs       # HMAC tags, replay window
+        ├── src/candidate.rs  # candidates and host gathering
+        ├── src/pair.rs       # candidate-pair state machine
+        ├── src/session.rs    # session typestate machine (sans-IO)
+        ├── src/agent.rs      # registration, lobby, session routing (sans-IO)
+        ├── src/stats.rs      # PING/PONG RTT, jitter and loss
+        ├── src/client.rs     # TLS + UdpSocket driver
+        ├── src/sim.rs        # NAT/loss simulation tests
+        └── examples/         # host.rs, join.rs, bridge.rs (stdin/stdout driver)
+scripts/
+├── datatest.py               # traffic tests over real connections (stdlib only)
+└── godot                     # runs the Godot pinned in mise.toml
+```
+
+### Getting started
+
+Install [mise](https://mise.jdx.dev), then:
+
+```sh
+mise install     # installs Go, Rust, just, Python and Godot at the pinned versions
+just             # list tasks
+just check       # lint + test everything
+just demo        # local server + a host + two joiners
+just live        # same, long-running, with the dashboard at http://127.0.0.1:8080
+```
+
+To run the pieces by hand:
+
+```sh
+just rendezvous::run -addr :7777            # writes its dev CA to bin/dev-ca.pem
+just client::host 127.0.0.1:7777            # prints "lobby K7M2QX"
+just client::join 127.0.0.1:7777 K7M2QX bob
+```
+
+### Deploying the server
+
+The image (`rendezvous/Dockerfile`, `just rendezvous::image <version>`) is a
+static binary on `gcr.io/distroless/static-debian13:nonroot`: about 17 MB,
+no shell, user 65532, base images pinned by digest. Without certificate flags
+it keeps a development CA in `/home/nonroot/dev-ca.pem` (`docker cp` it out).
+`-health :8081` serves `/healthz` separately from the dashboard, because the
+dashboard shows lobby codes.
+
+The Helm chart (`charts/rendezvous`, Helm 4) runs it with these settings:
+
+- **Exactly one replica, `Recreate` strategy.** Lobbies live in memory, and two
+  pods would split players between them.
+- **Pod Security Standard `restricted`,** plus a read-only root filesystem,
+  no service account token and no service links. Enforce it on the namespace
+  with `pod-security.kubernetes.io/enforce=restricted`.
+- **A NetworkPolicy:** the signalling port is open to everyone (or
+  `networkPolicy.signallingFrom`), the dashboard is closed, and all egress is
+  denied. The server only answers connections and never sends UDP.
+- **`GOMEMLIMIT`** is taken from the memory limit.
+- **TLS** (`tls.mode`):
+  - `selfSigned` (default): Helm generates a CA, keeps it across upgrades and
+    reissues the server certificate. Ship the Secret's `ca.crt` with the game.
+  - `certManager`: a cert-manager `Certificate`; clients then use public roots.
+  - `secret`: a `kubernetes.io/tls` Secret you manage.
+
+  The server re-reads its certificate every minute, so renewals need no restart.
+- **A `LoadBalancer` Service with `externalTrafficPolicy: Local`.** This is
+  the important part. The server must see each client's real public IP and
+  port, because that is the endpoint it hands to peers. Anything that rewrites
+  source addresses breaks punching: SNAT, proxying load balancers, and most
+  Gateway API implementations. If it happens, clients print the proxy as their
+  public endpoint, the dashboard shows the same IP for everyone, and the
+  per-IP rate limit lumps all players together.
+- **Gateway API (`gateway.enabled`)** is supported. The chart creates (or
+  attaches to) a Gateway with a `TCPRoute` (or a TLS-passthrough `TLSRoute`)
+  and a `UDPRoute` on the same port, and optionally an `HTTPRoute` for the
+  dashboard. These route kinds are in the experimental channel. Only use it
+  with an implementation that preserves client addresses for UDP.
+
+```sh
+helm install rv charts/rendezvous -n knockknock \
+  --set image.repository=registry.example.com/knockknock/rendezvous \
+  --set 'tls.selfSigned.hosts={rv.example.com}'
+kubectl get secret -n knockknock rv-rendezvous-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > godot/dev-ca.pem
+```
+
+### Testing data over real connections
+
+`scripts/datatest.py` starts a local server (or uses `--server`), a host and
+N joiners. Each peer is the real Rust client, driven through the `bridge`
+example.
+
+```sh
+just datatest bench                                   # echo test: loss, dupes, corruption, RTT
+just datatest --players 4 bench --count 2000 --size 1000 --rate 250
+just datatest chat                                    # type messages between host and players
+just datatest --server rv.example.com:7777 bench      # across real NATs (add --ca for a private CA)
+just datatest --dashboard 127.0.0.1:8080 chat         # watch it on the dashboard
+```
+
+`bench` checks that a 1168-byte payload round-trips and that 1169 bytes is
+rejected. It then sends paced, verifiable payloads that the host echoes back,
+and reports loss, duplicates, corruption and round-trip percentiles, followed by
+the library's own ping stats. The harness itself (Python, plus hex over pipes)
+tops out at roughly 2,000 echoed messages per second on a laptop; beyond that,
+its own queues add latency and loss. That is far above typical game rates.
+
+### TLS certificates
+
+Clients verify the server's certificate. In production, give the server a
+real certificate (`-tls-cert`, `-tls-key`); clients use the public roots
+(`ServerTrust::PublicRoots`). Without a certificate, the server keeps a
+development CA at `-tls-dev-ca` (reused across restarts) and serves a
+certificate for `-tls-dev-hosts` (localhost by default; add your LAN IP or
+hostname to test across machines). Clients then trust that file
+(`ServerTrust::ca_file`, `Knockknock.ca_file` in Godot). The examples and the
+test script read it from `$KNOCKKNOCK_CA`.
+
+### Using the Rust library
+
+```rust
+let mut host = Client::host("rv.example.com:7777", ServerTrust::PublicRoots)?;
+loop {
+    match host.poll()? {          // non-blocking: call once per frame
+        Some(Event::Registered { lobby: Some(lobby), .. }) => show_code(lobby),
+        Some(Event::Session { id, state: State::Connected { .. } }) => host.send(id, b"hi")?,
+        Some(Event::Data { session, data }) => handle(session, data),
+        _ => {}
+    }
+}
+```
+
+`Client` drives the TLS connection and a `std::net::UdpSocket`. To own the
+I/O yourself, drive an `Agent` instead. It is sans-IO: you feed it datagrams,
+decrypted signalling bytes and the current time, and it hands back datagrams,
+signalling bytes and events.
+
+### Using the Godot addon
+
+```sh
+just rendezvous::run          # local server; writes bin/dev-ca.pem
+just godot-editor             # builds the extension, opens godot/ in the editor
+just godot-smoke              # headless host + joiner end to end in real Godot
+```
+
+```gdscript
+# Host
+Knockknock.host_lobby("rv.example.com:7777")
+var opened = await Knockknock.lobby_opened            # [lobby_id, local_port]
+var peer := ENetMultiplayerPeer.new()
+peer.create_server(opened[1], 7)
+Knockknock.attach_host(peer.host)   # punches for joiners via ENet, reports ENet stats
+multiplayer.multiplayer_peer = peer
+
+# Joiner
+Knockknock.join_lobby("rv.example.com:7777", "K7M2QX")
+var ready = await Knockknock.join_ready                # [address, port, join_token]
+var peer := ENetMultiplayerPeer.new()
+peer.create_client(ready[0], ready[1], 0, 0, 0, Knockknock.get_local_port())
+multiplayer.multiplayer_peer = peer
+# …then send ready[2] to the host in your first RPC; the host checks it with
+# Knockknock.verify_join(multiplayer.multiplayer_peer.get_peer(id), token)
+```
+
+Connecting happens in the background: `host_lobby`/`join_lobby` return at
+once and report through signals. If the server connection drops, knockknock
+reconnects by itself and keeps the lobby (`server_lost`, then
+`server_restored`; `lobby_changed` if the server forgot it). Games in progress
+are unaffected throughout.
+
+Set `Knockknock.ca_file` to a CA file (e.g. `res://dev-ca.pem`) for a server
+without a public certificate. To use the addon in your own project, copy
+`godot/addons/knockknock` (with the built library in `bin/`) and enable the
+plugin; it registers the `Knockknock` autoload.

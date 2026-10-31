@@ -386,6 +386,7 @@ func TestUnboundAndRebindStats(t *testing.T) {
 func TestCounters(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxLobby = 2
+	cfg.ResumeGrace = 50 * time.Millisecond // abrupt disconnects expire quickly
 	ts := startServer(t, cfg)
 	host, a, b := newClient(t, ts), newClient(t, ts), newClient(t, ts)
 	lobby := host.register(true).Lobby
@@ -432,8 +433,10 @@ func TestCounters(t *testing.T) {
 	if c.BindsRejected[bindBadMAC] != 1 || c.BindsRejected[bindUnknownClient] != 1 || c.BindsRejected[bindReplay] != 1 {
 		t.Errorf("binds rejected: %v", c.BindsRejected)
 	}
-	if snap.Lifetimes.Clients.Count != 2 || snap.Lifetimes.Lobbies.Count != 0 {
-		t.Errorf("lifetimes: %+v", snap.Lifetimes)
+	// The polite leaver is gone at once; the abrupt one after the grace period.
+	snap = eventually(t, ts, "client lifetimes", func(s Snapshot) bool { return s.Lifetimes.Clients.Count == 2 })
+	if snap.Lifetimes.Lobbies.Count != 0 || snap.Counters.ResumeExpired != 1 {
+		t.Errorf("lifetimes %+v, expired %d", snap.Lifetimes, snap.Counters.ResumeExpired)
 	}
 
 	host.conn.Close()
@@ -478,5 +481,120 @@ func TestServerMeasuresLatency(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := ts.srv.Snapshot().ClientList[0].ServerRTTMs; got == nil || *got <= 0 {
 		t.Errorf("rtt after stale pong: %v (before %v)", got, before)
+	}
+}
+
+// reconnect opens a new signalling connection for c and resumes it.
+func (c *testClient) reconnect(secret auth.Key) *protocol.Registered {
+	c.t.Helper()
+	conn, err := tls.Dial("tcp", c.ts.addr.String(), &tls.Config{RootCAs: c.ts.roots})
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	c.t.Cleanup(func() { conn.Close() })
+	c.conn = conn
+	c.send(&protocol.Register{ResumeID: c.id, ResumeSecret: secret})
+	return c.recv().(*protocol.Registered)
+}
+
+func TestResumeKeepsLobbyAndSessions(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	host, joiner := newClient(t, ts), newClient(t, ts)
+	hr := host.register(true)
+	joiner.register(false)
+	joiner.send(&protocol.Join{Lobby: hr.Lobby})
+	sid := joiner.recv().(*protocol.PeerInfo).SessionID
+	host.recv()
+
+	// The host's connection drops; its lobby waits for it.
+	host.conn.Close()
+	snap := eventually(t, ts, "host detached", func(s Snapshot) bool {
+		for _, c := range s.ClientList {
+			if c.Role == "host" && c.Detached > 0 {
+				return true
+			}
+		}
+		return false
+	})
+	if len(snap.Lobbies) != 1 || len(snap.Lobbies[0].Sessions) != 1 {
+		t.Fatalf("lobby not kept: %+v", snap.Lobbies)
+	}
+
+	// Nobody can join while the host cannot be told.
+	late := newClient(t, ts)
+	late.register(false)
+	late.send(&protocol.Join{Lobby: hr.Lobby})
+	if e := late.recv().(*protocol.Error); e.Code != protocol.ErrLobbyNotFound {
+		t.Errorf("join to detached host: code %d", e.Code)
+	}
+
+	// Resume: same identity and lobby, and the server re-confirms the binding.
+	r := host.reconnect(host.secret)
+	if r.ClientID != host.id || r.Lobby != hr.Lobby || r.Secret != host.secret {
+		t.Fatalf("resume gave %+v", r)
+	}
+	if b := host.recv().(*protocol.Bound); b.Observed != host.gameAddr() {
+		t.Errorf("bound %v", b.Observed)
+	}
+	host.send(&protocol.Stats{Sessions: []protocol.SessionStats{{SessionID: sid, State: protocol.StateConnected, RTTMicros: 1000, RTTVarMicros: 100}}})
+	eventually(t, ts, "stats after resume", func(s Snapshot) bool {
+		return len(s.Lobbies) == 1 && len(s.Lobbies[0].Sessions) == 1 && s.Lobbies[0].Sessions[0].State == "connected"
+	})
+	if c := ts.srv.Snapshot().Counters; c.Resumed != 1 || c.Disconnects[reasonClosed] != 1 {
+		t.Errorf("counters: %+v", c)
+	}
+}
+
+func TestResumeReplacesStaleConnection(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	c := newClient(t, ts)
+	c.register(true)
+	old := c.conn
+
+	// The old connection looks alive to the server (e.g. a silent network
+	// change); the resumed one takes over and the old one is closed.
+	c.reconnect(c.secret)
+	c.recv() // BOUND
+	old.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := protocol.ReadFrame(old); err == nil {
+		t.Error("old connection still open")
+	}
+	c.send(&protocol.Ping{ID: 5})
+	if p, ok := c.recv().(*protocol.Pong); !ok || p.ID != 5 {
+		t.Errorf("resumed connection not working: %+v", p)
+	}
+	snap := ts.srv.Snapshot()
+	if snap.Clients != 1 || snap.ClientList[0].Detached != 0 || snap.Counters.Disconnects[reasonReplaced] != 1 {
+		t.Errorf("after takeover: clients=%d %+v %+v", snap.Clients, snap.ClientList, snap.Counters.Disconnects)
+	}
+}
+
+func TestResumeWithWrongSecretRegistersFresh(t *testing.T) {
+	ts := startServer(t, DefaultConfig())
+	c := newClient(t, ts)
+	first := c.register(true)
+	c.conn.Close()
+	r := c.reconnect(auth.Key{1})
+	if r.ClientID == first.ClientID || r.Lobby == first.Lobby {
+		t.Errorf("wrong secret resumed the old client: %+v", r)
+	}
+	if ts.srv.Snapshot().Counters.ResumeFailed != 1 {
+		t.Error("failed resume not counted")
+	}
+}
+
+func TestDetachedClientExpires(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ResumeGrace = 50 * time.Millisecond
+	ts := startServer(t, cfg)
+	c := newClient(t, ts)
+	first := c.register(true)
+	c.conn.Close()
+	eventually(t, ts, "expiry", func(s Snapshot) bool { return s.Clients == 0 && len(s.Lobbies) == 0 })
+
+	// Too late to resume: a fresh registration with a new lobby.
+	r := c.reconnect(c.secret)
+	if r.ClientID == first.ClientID || r.Lobby == first.Lobby {
+		t.Errorf("expired client resumed: %+v", r)
 	}
 }

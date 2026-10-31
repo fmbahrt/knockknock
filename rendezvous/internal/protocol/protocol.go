@@ -103,7 +103,11 @@ type Candidate struct {
 	Addr netip.AddrPort
 }
 
-const flagHost, flagNominate = 1, 1
+const (
+	flagHost     = 1
+	flagResume   = 2
+	flagNominate = 1
+)
 
 var (
 	ErrShort       = errors.New("protocol: message too short")
@@ -122,6 +126,11 @@ type Message interface {
 type Register struct {
 	Host       bool
 	Candidates []Candidate
+	// Resume, when ResumeID is non-zero, asks to take back an earlier
+	// registration (its lobby and sessions) after a lost connection. The
+	// secret is safe to send: signalling runs over TLS.
+	ResumeID     uint64
+	ResumeSecret auth.Key
 }
 
 type Registered struct {
@@ -324,9 +333,13 @@ func appendPayload(b []byte, m Message) ([]byte, error) {
 	var err error
 	switch m := m.(type) {
 	case *Register:
-		b = append(b, boolFlag(m.Host, flagHost))
+		b = append(b, boolFlag(m.Host, flagHost)|boolFlag(m.ResumeID != 0, flagResume))
 		if b, err = appendCandidates(b, m.Candidates); err != nil {
 			return nil, err
+		}
+		if m.ResumeID != 0 {
+			b = binary.BigEndian.AppendUint64(b, m.ResumeID)
+			b = append(b, m.ResumeSecret[:]...)
 		}
 	case *Registered:
 		b = binary.BigEndian.AppendUint64(b, m.ClientID)
@@ -391,7 +404,16 @@ func decodePayload(ty Type, payload []byte) (Message, error) {
 	var m Message
 	switch ty {
 	case TypeRegister:
-		m = &Register{Host: r.u8()&flagHost != 0, Candidates: r.candidates()}
+		flags := r.u8()
+		reg := &Register{Host: flags&flagHost != 0, Candidates: r.candidates()}
+		if flags&flagResume != 0 {
+			reg.ResumeID = r.u64()
+			copy(reg.ResumeSecret[:], r.take(16))
+			if r.err == nil && reg.ResumeID == 0 {
+				r.err = ErrBadField
+			}
+		}
+		m = reg
 	case TypeRegistered:
 		reg := &Registered{ClientID: r.u64()}
 		copy(reg.Secret[:], r.take(16))

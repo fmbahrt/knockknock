@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "strings": { "type": "array", "items": { "type": "string" } },
+    "map": { "type": "object", "additionalProperties": { "type": "string" } },
+    "list": { "type": "array", "items": { "type": "object" } }
+  },
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "$ref": "#/$defs/list" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": { "$ref": "#/$defs/port" },
+        "maxLobby": { "type": "integer", "minimum": 2, "maximum": 255 },
+        "rate": { "type": "number", "exclusiveMinimum": 0 },
+        "burst": { "type": "integer", "minimum": 1 },
+        "debug": { "type": "boolean" },
+        "extraArgs": { "$ref": "#/$defs/strings" }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["selfSigned", "certManager", "secret"] },
+        "selfSigned": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hosts": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "caDays": { "type": "integer", "minimum": 1 },
+            "days": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "issuerRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "kind": { "type": "string" },
+                "group": { "type": "string" }
+              }
+            },
+            "dnsNames": { "$ref": "#/$defs/strings" },
+            "duration": { "type": "string" },
+            "renewBefore": { "type": "string" }
+          }
+        },
+        "secret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "name": { "type": "string" } }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["", "ClusterIP", "NodePort", "LoadBalancer"] },
+        "externalTrafficPolicy": { "enum": ["Local", "Cluster"] },
+        "nodePort": { "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1, "maximum": 65535 }] },
+        "loadBalancerClass": { "type": "string" },
+        "loadBalancerSourceRanges": { "$ref": "#/$defs/strings" },
+        "ipFamilyPolicy": { "enum": ["", "SingleStack", "PreferDualStack", "RequireDualStack"] },
+        "ipFamilies": { "type": "array", "items": { "enum": ["IPv4", "IPv6"] } },
+        "annotations": { "$ref": "#/$defs/map" }
+      }
+    },
+    "dashboard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "$ref": "#/$defs/port" },
+        "httpRoute": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "annotations": { "$ref": "#/$defs/map" },
+            "parentRefs": { "$ref": "#/$defs/list" },
+            "hostnames": { "$ref": "#/$defs/strings" }
+          }
+        }
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "create": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "$ref": "#/$defs/map" },
+        "addresses": { "$ref": "#/$defs/list" },
+        "signallingRoute": { "enum": ["TCPRoute", "TLSRoute"] },
+        "hostnames": { "$ref": "#/$defs/strings" },
+        "parentRefs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tcp": { "$ref": "#/$defs/list" },
+            "udp": { "$ref": "#/$defs/list" }
+          }
+        },
+        "apiVersions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "gateway": { "type": "string" },
+            "httpRoute": { "type": "string" },
+            "tcpRoute": { "type": "string" },
+            "udpRoute": { "type": "string" },
+            "tlsRoute": { "type": "string" }
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "signallingFrom": { "$ref": "#/$defs/list" },
+        "dashboardFrom": { "$ref": "#/$defs/list" }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "$ref": "#/$defs/map" }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "resources": { "type": "object" },
+    "podAnnotations": { "$ref": "#/$defs/map" },
+    "podLabels": { "$ref": "#/$defs/map" },
+    "priorityClassName": { "type": "string" },
+    "nodeSelector": { "$ref": "#/$defs/map" },
+    "tolerations": { "$ref": "#/$defs/list" },
+    "affinity": { "type": "object" }
+  }
+}

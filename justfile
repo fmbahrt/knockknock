@@ -29,6 +29,15 @@ test:
 lint:
     @just rendezvous::lint
     @just client::lint
+    @just chart-lint
+
+# Lint the Helm chart and render its main variants
+chart-lint:
+    helm lint --strict charts/rendezvous
+    helm template t charts/rendezvous > /dev/null
+    helm template t charts/rendezvous --set tls.mode=certManager --set tls.certManager.issuerRef.name=le --set 'tls.certManager.dnsNames[0]=rv.example.com' > /dev/null
+    helm template t charts/rendezvous --set gateway.enabled=true --set gateway.create=true --set gateway.className=gc --set dashboard.enabled=true --set dashboard.httpRoute.enabled=true --set 'dashboard.httpRoute.parentRefs[0].name=web' > /dev/null
+    helm template t charts/rendezvous --set gateway.enabled=true --set gateway.signallingRoute=TLSRoute --set 'gateway.hostnames[0]=rv.example.com' --set 'gateway.parentRefs.tcp[0].name=g' --set 'gateway.parentRefs.udp[0].name=g' > /dev/null
 
 # Format all code
 fmt:

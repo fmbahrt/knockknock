@@ -62,6 +62,10 @@ pub struct Config {
     pub heartbeat_interval: Duration,
     /// Maximum number of pairs in `Checking` at once.
     pub max_concurrent_checks: usize,
+    /// First delay before reconnecting to the server after losing it;
+    /// doubles on each failed attempt up to `reconnect_max`.
+    pub reconnect_interval: Duration,
+    pub reconnect_max: Duration,
     /// How often an unconfirmed BIND is resent.
     pub server_retry: Duration,
     /// Granularity of the internal timers.
@@ -82,6 +86,8 @@ impl Default for Config {
             ping_interval: Some(Duration::from_secs(1)),
             stats_interval: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(30),
+            reconnect_interval: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
             max_concurrent_checks: 8,
             server_retry: Duration::from_millis(500),
             tick_interval: Duration::from_millis(50),

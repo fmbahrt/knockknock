@@ -1,0 +1,8 @@
+# Only what the build needs.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+**/*_test.go
+**/testdata/

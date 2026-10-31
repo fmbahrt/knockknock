@@ -210,7 +210,7 @@ impl SignalConn {
         if self.open {
             self.open = false;
             let _ = self.tcp.shutdown(std::net::Shutdown::Both);
-            agent.signal_closed();
+            agent.signal_closed(Instant::now());
         }
     }
 }
@@ -224,6 +224,8 @@ impl SignalConn {
 pub struct Client {
     socket: Option<UdpSocket>,
     local_port: u16,
+    server: String,
+    trust: ServerTrust,
     signal: SignalConn,
     agent: Agent,
     events: VecDeque<Event>,
@@ -263,6 +265,8 @@ impl Client {
         let mut client = Self {
             socket: Some(socket),
             local_port: local.port(),
+            server: server.to_owned(),
+            trust,
             signal,
             agent,
             events: VecDeque::new(),
@@ -370,9 +374,26 @@ impl Client {
     /// Moves bytes between the agent and the TLS connection, and sends
     /// queued datagrams.
     fn service(&mut self) -> Result<(), Error> {
+        self.reconnect();
         self.signal.pump(&mut self.agent)?;
         self.drain_outputs()?;
         self.signal.pump(&mut self.agent)
+    }
+
+    /// Re-opens the signalling connection when the agent asks for it. This
+    /// blocks for up to the connect timeout; game loops that cannot afford
+    /// that should drive an [`Agent`] themselves (as the Godot extension does).
+    fn reconnect(&mut self) {
+        if self.signal.is_open() || !self.agent.reconnect_due(Instant::now()) {
+            return;
+        }
+        match SignalConn::connect(&self.server, &self.trust) {
+            Ok((signal, _)) => {
+                self.signal = signal;
+                self.agent.signal_reconnected(Instant::now());
+            }
+            Err(_) => self.agent.reconnect_failed(Instant::now()),
+        }
     }
 
     /// Receives and handles one datagram. Returns false if none was ready.

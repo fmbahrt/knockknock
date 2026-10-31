@@ -1,0 +1,32 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rendezvous.fullname" . }}
+  labels:
+    {{- include "rendezvous.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rendezvous.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - port: signal-tcp
+          protocol: TCP
+        - port: signal-udp
+          protocol: UDP
+      {{- with .Values.networkPolicy.signallingFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if and .Values.dashboard.enabled .Values.networkPolicy.dashboardFrom }}
+    - ports:
+        - port: dashboard
+          protocol: TCP
+      from:
+        {{- toYaml .Values.networkPolicy.dashboardFrom | nindent 8 }}
+    {{- end }}
+  # No egress: the server only answers connections and never sends UDP.
+  egress: []
+{{- end }}

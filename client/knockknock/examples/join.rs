@@ -82,8 +82,8 @@ fn run(
                 }
             }
             Event::ServerError(code) => return Err(format!("server: {code}").into()),
-            Event::ServerLost if !connected => return Err("lost the rendezvous server".into()),
-            Event::ServerLost => {}
+            Event::ServerLost => println!("[{name}] lost the rendezvous server; reconnecting"),
+            Event::ServerRestored { .. } => println!("[{name}] back on the rendezvous server"),
         }
     }
 }

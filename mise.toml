@@ -3,6 +3,8 @@ go = "1.27.3"
 rust = "1.99.1"
 just = "1.59.0"
 python = "3.15.2"
+# Linting the Helm chart (charts/rendezvous).
+helm = "4.2.0"
 # Godot for the example project and headless smoke test (scripts/godot).
 "github:godotengine/godot" = "4.7.2-stable"
 

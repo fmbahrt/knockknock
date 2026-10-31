@@ -58,8 +58,13 @@ pub enum Event {
     Data { session: SessionId, data: Vec<u8> },
     /// The rendezvous server rejected a request.
     ServerError(ErrorCode),
-    /// The signalling connection ended. Established sessions keep running.
+    /// The signalling connection ended. Established sessions keep running,
+    /// and the driver reconnects (see [`Agent::reconnect_due`]).
     ServerLost,
+    /// Reconnected to the rendezvous server. A host whose old lobby expired
+    /// while it was away gets a new one: if `lobby` changed, share the new
+    /// code.
+    ServerRestored { lobby: Option<LobbyId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,21 +79,34 @@ pub enum Output {
     Event(Event),
 }
 
+/// What the server gave us. Kept across a lost connection so the next one
+/// can resume it, keeping the lobby and sessions.
+#[derive(Debug, Clone, Copy)]
+struct Registration {
+    client_id: u64,
+    secret: Key,
+    lobby: Option<LobbyId>,
+    bind_seq: u32,
+    bind_interval: Duration,
+    next_bind: Instant,
+    /// Our public game endpoint, once a BIND has been confirmed.
+    observed: Option<SocketAddr>,
+}
+
 #[derive(Debug)]
 enum Signalling {
-    /// REGISTER sent; waiting for REGISTERED.
-    Registering,
-    Registered {
-        client_id: u64,
-        secret: Key,
-        lobby: Option<LobbyId>,
-        bind_seq: u32,
-        bind_interval: Duration,
-        next_bind: Instant,
-        /// Our public game endpoint, once a BIND has been confirmed.
-        observed: Option<SocketAddr>,
+    /// REGISTER sent (resuming `resume`, if set); waiting for REGISTERED.
+    Registering {
+        resume: Option<Registration>,
     },
-    Lost,
+    Registered(Registration),
+    /// The connection dropped; the driver should reconnect at `retry_at`.
+    Lost {
+        resume: Option<Registration>,
+        retry_at: Instant,
+    },
+    /// We closed it; no reconnecting.
+    Closed,
 }
 
 #[derive(Debug)]
@@ -97,7 +115,11 @@ pub struct Agent {
     /// The server's UDP endpoint, for BIND.
     server: SocketAddr,
     mode: Mode,
+    /// Our host candidates, re-sent when re-registering.
+    candidates: Vec<Candidate>,
     signalling: Signalling,
+    /// Delay before the next reconnect attempt; doubles on failure.
+    backoff: Duration,
     decoder: FrameDecoder,
     sessions: HashMap<SessionId, SessionMachine>,
     /// The joiner's session before the server has introduced us.
@@ -134,7 +156,9 @@ impl Agent {
             cfg,
             server,
             mode,
-            signalling: Signalling::Registering,
+            candidates: local,
+            signalling: Signalling::Registering { resume: None },
+            backoff: cfg.reconnect_interval,
             decoder: FrameDecoder::default(),
             sessions: HashMap::new(),
             pending,
@@ -146,10 +170,7 @@ impl Agent {
             last_tick: now,
             out: VecDeque::new(),
         };
-        agent.signal(Message::Register {
-            host: mode.is_host(),
-            candidates: local,
-        });
+        agent.register(None);
         agent
     }
 
@@ -160,7 +181,36 @@ impl Agent {
     /// False once the signalling connection is gone (closed, corrupt, or
     /// [`Agent::close`]d); the driver should then drop it.
     pub fn signal_open(&self) -> bool {
-        !matches!(self.signalling, Signalling::Lost)
+        matches!(
+            self.signalling,
+            Signalling::Registering { .. } | Signalling::Registered(_)
+        )
+    }
+
+    /// Whether the driver should open a new signalling connection now. After
+    /// it does, call [`Agent::signal_reconnected`]; if it fails,
+    /// [`Agent::reconnect_failed`].
+    pub fn reconnect_due(&self, now: Instant) -> bool {
+        matches!(self.signalling, Signalling::Lost { retry_at, .. } if now >= retry_at)
+    }
+
+    /// A new signalling connection is up: re-register, resuming the earlier
+    /// registration if there was one.
+    pub fn signal_reconnected(&mut self, now: Instant) {
+        let Signalling::Lost { resume, .. } = self.signalling else {
+            return;
+        };
+        self.decoder = FrameDecoder::default();
+        self.next_heartbeat = now + self.cfg.heartbeat_interval;
+        self.register(resume);
+    }
+
+    /// The reconnect attempt failed; try again later, backing off.
+    pub fn reconnect_failed(&mut self, now: Instant) {
+        if let Signalling::Lost { retry_at, .. } = &mut self.signalling {
+            self.backoff = (self.backoff * 2).min(self.cfg.reconnect_max);
+            *retry_at = now + self.backoff;
+        }
     }
 
     pub fn session_state(&self, id: SessionId) -> Option<State> {
@@ -248,7 +298,8 @@ impl Agent {
     /// When [`Agent::handle_timeout`] should next be called.
     pub fn poll_timeout(&self) -> Option<Instant> {
         let bind = match &self.signalling {
-            Signalling::Registered { next_bind, .. } => Some(*next_bind),
+            Signalling::Registered(reg) if !self.udp_released => Some(reg.next_bind),
+            Signalling::Lost { retry_at, .. } => Some(*retry_at),
             _ => None,
         };
         let heartbeat = self.signal_open().then_some(self.next_heartbeat);
@@ -282,53 +333,57 @@ impl Agent {
                 Ok(Some(msg)) => self.handle_frame(msg, now),
                 Ok(None) => return,
                 Err(_) => {
-                    self.signal_closed();
+                    self.signal_closed(now);
                     return;
                 }
             }
         }
     }
 
-    /// Tells the agent the signalling connection has ended.
-    pub fn signal_closed(&mut self) {
-        if self.signal_open() {
-            self.signalling = Signalling::Lost;
-            // A joiner that has not been introduced yet cannot proceed.
-            self.pending = None;
-            self.event(Event::ServerLost);
-        }
+    /// Tells the agent the signalling connection has ended. Unless we closed
+    /// it, reconnecting becomes due after a backoff.
+    pub fn signal_closed(&mut self, now: Instant) {
+        let (resume, failed_attempt) = match self.signalling {
+            Signalling::Registered(reg) => (Some(reg), false),
+            Signalling::Registering { resume } => (resume, true),
+            Signalling::Lost { .. } | Signalling::Closed => return,
+        };
+        // A connection that drops before registering counts as a failed
+        // attempt; one that worked for a while starts the backoff afresh.
+        self.backoff = if failed_attempt {
+            (self.backoff * 2).min(self.cfg.reconnect_max)
+        } else {
+            self.cfg.reconnect_interval
+        };
+        self.signalling = Signalling::Lost {
+            resume,
+            retry_at: now + self.backoff,
+        };
+        self.event(Event::ServerLost);
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
         self.last_tick = now;
 
-        if let Signalling::Registered {
-            client_id,
-            secret,
-            bind_seq,
-            bind_interval,
-            next_bind,
-            observed,
-            ..
-        } = &mut self.signalling
-            && now >= *next_bind
+        if let Signalling::Registered(reg) = &mut self.signalling
+            && now >= reg.next_bind
             && !self.udp_released
         {
             // Retry quickly until the first BIND is confirmed, then refresh
             // to keep the NAT mapping (and so the candidate) alive.
-            *next_bind = now
-                + if observed.is_some() {
-                    *bind_interval
+            reg.next_bind = now
+                + if reg.observed.is_some() {
+                    reg.bind_interval
                 } else {
                     self.cfg.server_retry
                 };
             let packet = Packet {
-                id: *client_id,
-                seq: *bind_seq,
+                id: reg.client_id,
+                seq: reg.bind_seq,
                 msg: Message::Bind,
             };
-            *bind_seq = bind_seq.wrapping_add(1);
-            if let Ok(bytes) = packet.encode(secret, Dir::ClientToServer) {
+            reg.bind_seq = reg.bind_seq.wrapping_add(1);
+            if let Ok(bytes) = packet.encode(&reg.secret, Dir::ClientToServer) {
                 self.out.push_back(Output::Transmit {
                     to: self.server,
                     bytes,
@@ -383,8 +438,8 @@ impl Agent {
         self.pending = None;
         if self.signal_open() {
             self.signal(Message::Close { reason: 0 });
-            self.signalling = Signalling::Lost;
         }
+        self.signalling = Signalling::Closed;
     }
 
     fn handle_frame(&mut self, msg: Message, now: Instant) {
@@ -394,17 +449,7 @@ impl Agent {
                 secret,
                 lobby,
                 bind_secs,
-            } if matches!(self.signalling, Signalling::Registering) => {
-                self.signalling = Signalling::Registered {
-                    client_id,
-                    secret,
-                    lobby,
-                    bind_seq: 0,
-                    bind_interval: Duration::from_secs(u64::from(bind_secs.max(1))),
-                    next_bind: now,
-                    observed: None,
-                };
-            }
+            } => self.handle_registered(client_id, secret, lobby, bind_secs, now),
             Message::Bound { observed } => self.handle_bound(observed, now),
             // The server measures signalling latency for its dashboard.
             Message::Ping { id } => self.signal(Message::Pong { id }),
@@ -424,27 +469,70 @@ impl Agent {
         }
     }
 
-    fn handle_bound(&mut self, new: SocketAddr, now: Instant) {
-        let Signalling::Registered {
-            lobby,
-            observed,
-            bind_interval,
-            next_bind,
-            ..
-        } = &mut self.signalling
-        else {
+    fn handle_registered(
+        &mut self,
+        client_id: u64,
+        secret: Key,
+        lobby: Option<LobbyId>,
+        bind_secs: u16,
+        now: Instant,
+    ) {
+        let Signalling::Registering { resume } = self.signalling else {
             return;
         };
-        let first = observed.is_none();
-        if *observed == Some(new) {
+        let bind_interval = Duration::from_secs(u64::from(bind_secs.max(1)));
+        self.backoff = self.cfg.reconnect_interval;
+        match resume {
+            // Resumed: same identity, lobby and sessions. BIND right away so
+            // the server sees our current mapping.
+            Some(old) if old.client_id == client_id => {
+                self.signalling = Signalling::Registered(Registration {
+                    secret,
+                    lobby,
+                    bind_interval,
+                    next_bind: now,
+                    ..old
+                });
+                self.event(Event::ServerRestored { lobby });
+                // A JOIN the old connection lost.
+                if let (Mode::Join(lobby), Some(_), Some(_)) =
+                    (self.mode, &self.pending, old.observed)
+                {
+                    self.signal(Message::Join { lobby });
+                }
+            }
+            // New (first time, or the server forgot us).
+            _ => {
+                self.signalling = Signalling::Registered(Registration {
+                    client_id,
+                    secret,
+                    lobby,
+                    bind_seq: 0,
+                    bind_interval,
+                    next_bind: now,
+                    observed: None,
+                });
+                if resume.is_some() {
+                    self.event(Event::ServerRestored { lobby });
+                }
+            }
+        }
+    }
+
+    fn handle_bound(&mut self, new: SocketAddr, now: Instant) {
+        let Signalling::Registered(reg) = &mut self.signalling else {
+            return;
+        };
+        let first = reg.observed.is_none();
+        if reg.observed == Some(new) {
             return;
         }
         if first {
             // Confirmed: switch from retrying to refreshing.
-            *next_bind = now + *bind_interval;
+            reg.next_bind = now + reg.bind_interval;
         }
-        *observed = Some(new);
-        let lobby = *lobby;
+        reg.observed = Some(new);
+        let lobby = reg.lobby;
         self.event(Event::Registered {
             observed: new,
             lobby,
@@ -487,7 +575,7 @@ impl Agent {
     /// Hosts report their sessions' path quality to the server.
     fn wants_stats(&self) -> bool {
         self.mode.is_host()
-            && matches!(self.signalling, Signalling::Registered { .. })
+            && matches!(self.signalling, Signalling::Registered(_))
             && !self.sessions.is_empty()
     }
 
@@ -516,6 +604,15 @@ impl Agent {
             .take(MAX_STATS)
             .collect();
         self.signal(Message::Stats(entries));
+    }
+
+    fn register(&mut self, resume: Option<Registration>) {
+        self.signalling = Signalling::Registering { resume };
+        self.signal(Message::Register {
+            host: self.mode.is_host(),
+            candidates: self.candidates.clone(),
+            resume: resume.map(|r| (r.client_id, r.secret)),
+        });
     }
 
     fn signal(&mut self, msg: Message) {
@@ -794,7 +891,7 @@ mod tests {
         feed(&mut agent, peer_info(5, Role::Controlling), now);
         drain(&mut agent);
 
-        agent.signal_closed();
+        agent.signal_closed(now);
         assert!(!agent.signal_open());
         assert_eq!(drain(&mut agent).events, [Event::ServerLost]);
         assert_eq!(agent.session_state(5), Some(State::Connecting));
@@ -945,5 +1042,134 @@ mod tests {
         assert!(d.to_server.is_empty());
         assert!(d.signals.iter().any(|m| matches!(m, Message::Ping { .. })));
         assert!(agent.signal_open());
+    }
+
+    fn registered(client_id: u64, lobby: Option<LobbyId>) -> Message {
+        Message::Registered {
+            client_id,
+            secret: SECRET,
+            lobby,
+            bind_secs: 15,
+        }
+    }
+
+    #[test]
+    fn reconnects_with_backoff_and_resumes() {
+        let t0 = Instant::now();
+        let cfg = Config::default();
+        let lobby: LobbyId = "K7M2QX".parse().unwrap();
+        let mut agent = Agent::new(cfg, server(), vec![], Mode::HostSendOnly, t0);
+        register(&mut agent, Some(lobby), t0);
+        let bind_seq_before = {
+            agent.handle_timeout(t0 + Duration::from_secs(15));
+            drain(&mut agent).to_server[0].seq
+        };
+
+        agent.signal_closed(t0);
+        assert_eq!(drain(&mut agent).events, [Event::ServerLost]);
+        assert!(!agent.reconnect_due(t0));
+        assert_eq!(agent.poll_timeout(), Some(t0 + cfg.reconnect_interval));
+        let t1 = t0 + cfg.reconnect_interval;
+        assert!(agent.reconnect_due(t1));
+
+        // The first attempt fails; the next waits twice as long.
+        agent.reconnect_failed(t1);
+        assert!(!agent.reconnect_due(t1 + cfg.reconnect_interval));
+        let t2 = t1 + 2 * cfg.reconnect_interval;
+        assert!(agent.reconnect_due(t2));
+
+        agent.signal_reconnected(t2);
+        assert!(agent.signal_open());
+        let d = drain(&mut agent);
+        assert!(
+            matches!(d.signals[..], [Message::Register { host: true, resume: Some((CLIENT, s)), .. }] if s == SECRET),
+            "{:?}",
+            d.signals
+        );
+
+        // Same identity back: lobby kept, BIND right away, sequence continues.
+        feed(&mut agent, registered(CLIENT, Some(lobby)), t2);
+        assert_eq!(
+            drain(&mut agent).events,
+            [Event::ServerRestored { lobby: Some(lobby) }]
+        );
+        agent.handle_timeout(t2);
+        let binds = drain(&mut agent).to_server;
+        assert_eq!(binds.len(), 1);
+        assert!(binds[0].seq > bind_seq_before);
+    }
+
+    #[test]
+    fn forgotten_client_registers_fresh_with_a_new_lobby() {
+        let now = Instant::now();
+        let old: LobbyId = "K7M2QX".parse().unwrap();
+        let new: LobbyId = "ZZZZZZ".parse().unwrap();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::HostSendOnly, now);
+        register(&mut agent, Some(old), now);
+        agent.signal_closed(now);
+        agent.signal_reconnected(now);
+        drain(&mut agent);
+
+        // The grace period passed (or the server restarted): a new identity.
+        feed(&mut agent, registered(CLIENT + 1, Some(new)), now);
+        assert_eq!(
+            drain(&mut agent).events,
+            [Event::ServerRestored { lobby: Some(new) }]
+        );
+        agent.handle_timeout(now);
+        let d = drain(&mut agent);
+        assert!(matches!(d.to_server[..], [Packet { id, seq: 0, .. }] if id == CLIENT + 1));
+        feed(
+            &mut agent,
+            Message::Bound {
+                observed: observed(),
+            },
+            now,
+        );
+        assert_eq!(
+            drain(&mut agent).events,
+            [Event::Registered {
+                observed: observed(),
+                lobby: Some(new)
+            }]
+        );
+    }
+
+    #[test]
+    fn joiner_rejoins_after_resuming() {
+        let now = Instant::now();
+        let lobby: LobbyId = "K7M2QX".parse().unwrap();
+        let mut agent = Agent::new(Config::default(), server(), vec![], Mode::Join(lobby), now);
+        register(&mut agent, None, now); // sends JOIN
+        // The connection drops before PEER_INFO arrives.
+        agent.signal_closed(now);
+        agent.signal_reconnected(now);
+        drain(&mut agent);
+        feed(&mut agent, registered(CLIENT, None), now);
+        let d = drain(&mut agent);
+        assert_eq!(d.events, [Event::ServerRestored { lobby: None }]);
+        assert!(matches!(d.signals[..], [Message::Join { lobby: l }] if l == lobby));
+    }
+
+    #[test]
+    fn backoff_is_capped_and_close_stops_reconnecting() {
+        let now = Instant::now();
+        let cfg = Config::default();
+        let mut agent = Agent::new(cfg, server(), vec![], Mode::Host, now);
+        register(&mut agent, None, now);
+        agent.signal_closed(now);
+        for _ in 0..10 {
+            agent.reconnect_failed(now);
+        }
+        assert!(agent.reconnect_due(now + cfg.reconnect_max));
+
+        // Dropping again before registering also backs off.
+        agent.signal_reconnected(now);
+        agent.signal_closed(now);
+        assert!(!agent.reconnect_due(now + cfg.reconnect_max - Duration::from_millis(1)));
+
+        agent.close();
+        assert!(!agent.reconnect_due(now + Duration::from_secs(3600)));
+        assert!(!agent.signal_open());
     }
 }

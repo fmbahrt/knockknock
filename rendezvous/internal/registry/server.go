@@ -7,6 +7,7 @@ package registry
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -33,6 +34,9 @@ type Config struct {
 	// PingInterval is how often the server pings each client over TLS to
 	// measure client↔server latency.
 	PingInterval time.Duration
+	// ResumeGrace is how long a client whose connection dropped (without
+	// CLOSE) keeps its lobby and sessions, waiting to resume.
+	ResumeGrace time.Duration
 	// MaxLobby is the maximum number of peers in a lobby, host included.
 	MaxLobby int
 	// Rate and Burst limit new connections and joins per source IP.
@@ -46,6 +50,7 @@ func DefaultConfig() Config {
 		IdleTimeout:      90 * time.Second,
 		HandshakeTimeout: 10 * time.Second,
 		PingInterval:     10 * time.Second,
+		ResumeGrace:      60 * time.Second,
 		MaxLobby:         8,
 		Rate:             5,
 		Burst:            20,
@@ -61,8 +66,10 @@ type client struct {
 	secret     auth.Key
 	ip         netip.Addr // of the signalling connection
 	conn       net.Conn
-	out        chan []byte
-	closed     bool
+	out        chan []byte    // nil while detached
+	closed     bool           // removed for good
+	gen        uint64         // bumped on every (re)attach, so a replaced connection cannot detach the new one
+	detachedAt time.Time      // when the connection dropped; zero while attached
 	observed   netip.AddrPort // public game endpoint; invalid until the first BIND
 	candidates []protocol.Candidate
 	recvWindow auth.ReplayWindow
@@ -81,6 +88,8 @@ type client struct {
 }
 
 func (c *client) bound() bool { return c.observed.IsValid() }
+
+func (c *client) detached() bool { return !c.detachedAt.IsZero() }
 
 type lobby struct {
 	id       protocol.LobbyID
@@ -153,6 +162,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go func() { errc <- s.serveTCP(ctx, tls.NewListener(ln, s.tls), &conns) }()
 	go s.pruneLimiter(ctx)
 	go s.pingClients(ctx)
+	go s.expireDetached(ctx)
 
 	err := <-errc
 	cancel()
@@ -214,9 +224,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, ip netip.Addr) {
 	}
 	conn.SetDeadline(time.Time{})
 
-	c := s.register(conn, ip, reg)
+	c, gen := s.register(conn, ip, reg)
 	reason := reasonError
-	defer func() { s.disconnect(c, reason) }()
+	defer func() { s.disconnect(c, gen, reason) }()
 	for {
 		conn.SetReadDeadline(s.now().Add(s.cfg.IdleTimeout))
 		msg, err := protocol.ReadFrame(conn)
@@ -255,20 +265,28 @@ func (s *Server) readFailure(ctx context.Context, c *client, err error) string {
 	}
 }
 
-func (s *Server) register(conn net.Conn, ip netip.Addr, m *protocol.Register) *client {
+// register attaches conn to a new client, or to the client it resumes. It
+// returns the client and the attachment generation.
+func (s *Server) register(conn net.Conn, ip netip.Addr, m *protocol.Register) (*client, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if m.ResumeID != 0 {
+		if c, ok := s.clients[m.ResumeID]; ok && subtle.ConstantTimeCompare(c.secret[:], m.ResumeSecret[:]) == 1 {
+			s.resume(c, conn, ip)
+			return c, c.gen
+		}
+		// Expired or unknown: fall through to a fresh registration.
+		s.counters.ResumeFailed++
+	}
 
 	c := &client{
 		id:         s.newID(func(id uint64) bool { return s.clients[id] != nil }),
 		secret:     auth.NewKey(),
-		ip:         ip,
-		conn:       conn,
-		out:        make(chan []byte, outQueue),
 		candidates: m.Candidates,
 		connected:  s.now(),
 	}
-	go s.writeLoop(c)
+	s.attach(c, conn, ip)
 	s.clients[c.id] = c
 	if m.Host {
 		s.counters.Hosts++
@@ -281,41 +299,116 @@ func (s *Server) register(conn net.Conn, ip netip.Addr, m *protocol.Register) *c
 		c.lobby = l
 	}
 	s.log.Info("registered", "client", c.id, "ip", ip, "lobby", c.lobbyID())
+	s.sendRegistered(c)
+	return c, c.gen
+}
+
+// resume moves an existing client onto a new connection. If its old
+// connection still looks alive (the server has not noticed it die yet), it is
+// replaced.
+func (s *Server) resume(c *client, conn net.Conn, ip netip.Addr) {
+	if !c.detached() {
+		// The old connection's cleanup will see a newer generation and do
+		// nothing, so count it here.
+		s.counters.Disconnects[reasonReplaced]++
+		c.dropReason = reasonReplaced
+		c.conn.Close()
+		close(c.out)
+	}
+	s.attach(c, conn, ip)
+	s.counters.Resumed++
+	s.log.Info("resumed", "client", c.id, "ip", ip, "lobby", c.lobbyID())
+	s.sendRegistered(c)
+	if c.bound() {
+		s.send(c, &protocol.Bound{Observed: c.observed})
+	}
+}
+
+func (s *Server) attach(c *client, conn net.Conn, ip netip.Addr) {
+	c.gen++
+	c.conn, c.ip = conn, ip
+	c.out = make(chan []byte, outQueue)
+	c.detachedAt = time.Time{}
+	c.dropReason = ""
+	c.pingSent = time.Time{}
+	go s.writeLoop(c, conn, c.out, c.gen)
+}
+
+func (s *Server) sendRegistered(c *client) {
 	s.send(c, &protocol.Registered{
 		ClientID: c.id,
 		Secret:   c.secret,
 		Lobby:    c.lobbyID(),
 		BindSecs: uint16(s.cfg.BindInterval / time.Second),
 	})
-	return c
 }
 
-func (s *Server) writeLoop(c *client) {
-	for b := range c.out {
-		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := c.conn.Write(b); err != nil {
+func (s *Server) writeLoop(c *client, conn net.Conn, out <-chan []byte, gen uint64) {
+	for b := range out {
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write(b); err != nil {
 			s.mu.Lock()
-			if c.dropReason == "" {
+			if c.gen == gen && c.dropReason == "" {
 				c.dropReason = reasonWrite
 			}
 			s.mu.Unlock()
-			c.conn.Close() // ends the read loop, which cleans up
+			conn.Close() // ends the read loop, which cleans up
 			return
 		}
 	}
 }
 
-func (s *Server) disconnect(c *client, reason string) {
+// disconnect handles the end of attachment gen. A client that left
+// politely is removed; one whose connection just dropped is detached and
+// keeps its lobby and sessions for ResumeGrace.
+func (s *Server) disconnect(c *client, gen uint64, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.log.Info("client left", "client", c.id, "reason", reason)
-	now := s.now()
+	if c.gen != gen || c.closed {
+		return // replaced by a resumed connection, or already gone
+	}
 	s.counters.Disconnects[reason]++
-	s.clientLifetimes.add(now.Sub(c.connected))
+	switch reason {
+	case reasonLeft, reasonBadRequest, reasonShutdown:
+		s.log.Info("client left", "client", c.id, "reason", reason)
+		s.finish(c, s.now())
+	default:
+		s.log.Info("client detached", "client", c.id, "reason", reason, "grace", s.cfg.ResumeGrace)
+		close(c.out)
+		c.out, c.conn = nil, nil
+		c.detachedAt = s.now()
+	}
+}
+
+// finish removes a client for good and records its lifetime.
+func (s *Server) finish(c *client, end time.Time) {
+	s.clientLifetimes.add(end.Sub(c.connected))
 	if c.lobby != nil {
-		s.lobbyLifetimes.add(now.Sub(c.lobby.created))
+		s.lobbyLifetimes.add(end.Sub(c.lobby.created))
 	}
 	s.removeClient(c)
+}
+
+// expireDetached removes clients that did not resume within ResumeGrace.
+func (s *Server) expireDetached(ctx context.Context) {
+	t := time.NewTicker(max(s.cfg.ResumeGrace/4, 10*time.Millisecond))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			s.mu.Lock()
+			for _, c := range s.clients {
+				if c.detached() && now.Sub(c.detachedAt) > s.cfg.ResumeGrace {
+					s.log.Info("client expired", "client", c.id)
+					s.counters.ResumeExpired++
+					s.finish(c, c.detachedAt)
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
 }
 
 // handleFrame processes one frame from a registered client. It returns false
@@ -354,6 +447,9 @@ func (s *Server) pingClients(ctx context.Context) {
 		case now := <-t.C:
 			s.mu.Lock()
 			for _, c := range s.clients {
+				if c.detached() {
+					continue
+				}
 				c.pingID++
 				c.pingSent = now
 				s.send(c, &protocol.Ping{ID: c.pingID})
@@ -452,7 +548,8 @@ func (s *Server) join(c *client, m *protocol.Join) {
 		return
 	}
 	l, ok := s.lobbies[m.Lobby]
-	if !ok || l.host == c || !l.host.bound() {
+	// A detached host could not receive the introduction.
+	if !ok || l.host == c || !l.host.bound() || l.host.detached() {
 		fail(joinNotFound, protocol.ErrLobbyNotFound)
 		return
 	}
@@ -503,7 +600,7 @@ func (s *Server) introduce(sess *session) {
 // send queues a frame for c. A client too slow to drain its queue is
 // disconnected rather than allowed to stall the server. Callers hold mu.
 func (s *Server) send(c *client, m protocol.Message) {
-	if c.closed {
+	if c.closed || c.out == nil {
 		return
 	}
 	b, err := protocol.AppendFrame(nil, m)
@@ -538,7 +635,10 @@ func (s *Server) removeClient(c *client) {
 	}
 	delete(s.clients, c.id)
 	c.closed = true
-	close(c.out)
+	if c.out != nil {
+		close(c.out)
+		c.out = nil
+	}
 }
 
 func (s *Server) removeSession(sess *session) {

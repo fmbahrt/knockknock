@@ -3,12 +3,15 @@
 //! `ENetMultiplayerPeer` (`docs/design.md` §15).
 //!
 //! Exposes one class, `KnockknockClient` (a `Node`); the addon registers it as
-//! the `Knockknock` autoload. Everything runs on the main thread from
-//! `_process`.
+//! the `Knockknock` autoload. Everything runs from `_process` on the main
+//! thread, except connecting to the server (DNS and TCP), which runs on a
+//! short-lived background thread so the game never stalls.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use godot::classes::enet_packet_peer::{PeerState, PeerStatistic};
@@ -47,12 +50,45 @@ enum Emit {
     JoinReady(SocketAddr, String),
     JoinFailed(String),
     ServerLost,
+    ServerRestored,
+    LobbyChanged(String),
     Error(String),
+}
+
+/// The result of connecting to the server on a background thread.
+type Dialed = Result<(SignalConn, SocketAddr), String>;
+
+/// Connects to the rendezvous server off the main thread.
+fn dial(server: String, trust: ServerTrust) -> Receiver<Dialed> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(SignalConn::connect(&server, &trust).map_err(|e| e.to_string()));
+    });
+    rx
+}
+
+enum Phase {
+    Idle,
+    /// Connecting for the first time. The agent is created once the server's
+    /// address is known.
+    Starting {
+        dialing: Receiver<Dialed>,
+        mode: Mode,
+        socket: UdpSocket,
+        server: String,
+        trust: ServerTrust,
+    },
+    Running(Box<Conn>),
 }
 
 struct Conn {
     agent: Agent,
-    signal: SignalConn,
+    /// The signalling connection; `None` while lost.
+    signal: Option<SignalConn>,
+    /// A reconnect in progress.
+    dialing: Option<Receiver<Dialed>>,
+    server: String,
+    trust: ServerTrust,
     /// The game socket, until it is handed to ENet.
     socket: Option<UdpSocket>,
     local_port: u16,
@@ -91,7 +127,7 @@ pub struct KnockknockClient {
     /// Empty: the public Web PKI roots.
     #[var]
     ca_file: GString,
-    conn: Option<Conn>,
+    phase: Phase,
     pending: Vec<Emit>,
 }
 
@@ -101,7 +137,7 @@ impl INode for KnockknockClient {
         Self {
             base,
             ca_file: GString::new(),
-            conn: None,
+            phase: Phase::Idle,
             pending: Vec::new(),
         }
     }
@@ -147,20 +183,33 @@ impl KnockknockClient {
     #[signal]
     fn join_failed(reason: GString);
 
-    /// The rendezvous server connection ended. Connected games keep running.
+    /// The rendezvous server connection ended. Connected games keep running,
+    /// and knockknock reconnects in the background.
     #[signal]
     fn server_lost();
+
+    /// Reconnected to the rendezvous server; the lobby and its players were
+    /// kept.
+    #[signal]
+    fn server_restored();
+
+    /// Host: the old lobby expired while the server was unreachable, and this
+    /// is the new code to share. Players already connected are unaffected.
+    #[signal]
+    fn lobby_changed(lobby_id: GString);
 
     #[signal]
     fn error(message: GString);
 
     /// Opens a lobby on the rendezvous server at `server` (`host:port`).
+    /// Returns at once; the result arrives as `lobby_opened` or `error`.
     #[func]
     fn host_lobby(&mut self, server: GString) -> GdError {
         self.start(&server.to_string(), Mode::HostSendOnly)
     }
 
     /// Joins `lobby_id` on the rendezvous server at `server` (`host:port`).
+    /// Returns at once; the result arrives as `join_ready` or `join_failed`.
     #[func]
     fn join_lobby(&mut self, server: GString, lobby_id: GString) -> GdError {
         match lobby_id.to_string().trim().parse::<LobbyId>() {
@@ -179,7 +228,7 @@ impl KnockknockClient {
     /// ENet's RTT and loss to the server.
     #[func]
     fn attach_host(&mut self, enet: Gd<ENetConnection>) {
-        if let Some(conn) = &mut self.conn {
+        if let Phase::Running(conn) = &mut self.phase {
             conn.enet = Some(enet);
         }
     }
@@ -188,7 +237,7 @@ impl KnockknockClient {
     /// impostor (someone who found the port without joining the lobby).
     #[func]
     fn verify_join(&mut self, peer: Gd<ENetPacketPeer>, token: GString) -> bool {
-        let Some(conn) = &mut self.conn else {
+        let Phase::Running(conn) = &mut self.phase else {
             return false;
         };
         let Some(addr) = peer_addr(&peer) else {
@@ -212,70 +261,113 @@ impl KnockknockClient {
     /// punched NAT mapping.
     #[func]
     fn get_local_port(&self) -> i64 {
-        self.conn.as_ref().map_or(0, |c| i64::from(c.local_port))
+        match &self.phase {
+            Phase::Running(c) => i64::from(c.local_port),
+            Phase::Starting { socket, .. } => {
+                socket.local_addr().map_or(0, |a| i64::from(a.port()))
+            }
+            Phase::Idle => 0,
+        }
     }
 
     /// The lobby ID once open (host), else empty.
     #[func]
     fn get_lobby_id(&self) -> GString {
-        self.conn
-            .as_ref()
-            .and_then(|c| c.lobby)
-            .map_or_else(GString::new, |l| GString::from(&l.to_string()))
+        match &self.phase {
+            Phase::Running(conn) => conn
+                .lobby
+                .map_or_else(GString::new, |l| GString::from(&l.to_string())),
+            _ => GString::new(),
+        }
     }
 
     /// Leaves the lobby and closes the server connection.
     #[func]
     fn close(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
+        // A dial still in flight finishes on its own; its result is dropped.
+        if let Phase::Running(mut conn) = std::mem::replace(&mut self.phase, Phase::Idle) {
             conn.agent.close();
             let _ = drain(&mut conn, &mut Vec::new());
-            let _ = conn.signal.close();
+            if let Some(signal) = conn.signal.take() {
+                let _ = signal.close();
+            }
         }
     }
 }
 
 impl KnockknockClient {
+    /// Starts connecting in the background. Only local setup (reading the
+    /// CA file, binding the game socket) happens here.
     fn start(&mut self, server: &str, mode: Mode) -> GdError {
         self.close();
-        match self.connect(server, mode) {
-            Ok(conn) => {
-                self.conn = Some(conn);
+        let setup = || -> io::Result<(ServerTrust, UdpSocket)> {
+            let trust = self.trust()?;
+            // IPv4 game socket; the server address is resolved off-thread.
+            let socket = UdpSocket::bind("0.0.0.0:0")?;
+            socket.set_nonblocking(true)?;
+            Ok((trust, socket))
+        };
+        match setup() {
+            Ok((trust, socket)) => {
+                self.phase = Phase::Starting {
+                    dialing: dial(server.to_owned(), trust.clone()),
+                    mode,
+                    socket,
+                    server: server.to_owned(),
+                    trust,
+                };
                 GdError::OK
             }
             Err(e) => {
-                let msg = format!("could not reach {server}: {e}");
-                self.pending.push(if mode.is_host() {
-                    Emit::Error(msg)
-                } else {
-                    Emit::JoinFailed(msg)
-                });
-                GdError::ERR_CANT_CONNECT
+                self.fail_start(mode, format!("cannot start: {e}"));
+                GdError::ERR_CANT_CREATE
             }
         }
     }
 
-    fn connect(&self, server: &str, mode: Mode) -> Result<Conn, knockknock::Error> {
-        let trust = self.trust()?;
-        let (signal, addr) = SignalConn::connect(server, &trust)?;
-        let any: SocketAddr = if addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+    fn fail_start(&mut self, mode: Mode, msg: String) {
+        self.pending.push(if mode.is_host() {
+            Emit::Error(msg)
         } else {
-            "[::]:0".parse().unwrap()
+            Emit::JoinFailed(msg)
+        });
+    }
+
+    /// Finishes starting once the background connect reports back.
+    fn finish_start(&mut self) {
+        let Phase::Starting { dialing, .. } = &self.phase else {
+            return;
         };
-        let socket = UdpSocket::bind(any)?;
-        socket.set_nonblocking(true)?;
-        let local = socket.local_addr()?;
-        let agent = Agent::new(
-            Config::default(),
-            addr,
-            gather_host(local, addr)?,
+        let result = match dialing.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("connect thread died".into()),
+        };
+        let Phase::Starting {
             mode,
-            Instant::now(),
-        );
-        Ok(Conn {
-            agent,
-            signal,
+            socket,
+            server,
+            trust,
+            ..
+        } = std::mem::replace(&mut self.phase, Phase::Idle)
+        else {
+            unreachable!()
+        };
+        let (signal, addr) = match result {
+            Ok(dialed) => dialed,
+            Err(e) => return self.fail_start(mode, format!("could not reach {server}: {e}")),
+        };
+        let local = match socket.local_addr() {
+            Ok(local) => local,
+            Err(e) => return self.fail_start(mode, e.to_string()),
+        };
+        let candidates = gather_host(local, addr).unwrap_or_default();
+        self.phase = Phase::Running(Box::new(Conn {
+            agent: Agent::new(Config::default(), addr, candidates, mode, Instant::now()),
+            signal: Some(signal),
+            dialing: None,
+            server,
+            trust,
             socket: Some(socket),
             local_port: local.port(),
             host: mode.is_host(),
@@ -283,7 +375,7 @@ impl KnockknockClient {
             peers: HashMap::new(),
             next_enet_poll: Instant::now(),
             lobby: None,
-        })
+        }));
     }
 
     fn trust(&self) -> io::Result<ServerTrust> {
@@ -302,11 +394,13 @@ impl KnockknockClient {
     }
 
     fn pump(&mut self) -> Result<(), knockknock::Error> {
-        let Some(conn) = &mut self.conn else {
+        self.finish_start();
+        let Phase::Running(conn) = &mut self.phase else {
             return Ok(());
         };
         let now = Instant::now();
-        conn.signal.pump(&mut conn.agent)?;
+        reconnect(conn, now);
+        pump_signal(conn)?;
 
         if let Some(socket) = &conn.socket {
             let mut buf = [0u8; 1500];
@@ -330,12 +424,12 @@ impl KnockknockClient {
             conn.agent.handle_timeout(now);
         }
         drain(conn, &mut self.pending)?;
-        conn.signal.pump(&mut conn.agent)?;
+        pump_signal(conn)?;
         Ok(())
     }
 
     fn drop_conn(&mut self) {
-        self.conn = None;
+        self.phase = Phase::Idle;
     }
 
     fn emit_pending(&mut self) {
@@ -359,10 +453,43 @@ impl KnockknockClient {
                 ),
                 Emit::JoinFailed(reason) => sig.join_failed().emit(&GString::from(&reason)),
                 Emit::ServerLost => sig.server_lost().emit(),
+                Emit::ServerRestored => sig.server_restored().emit(),
+                Emit::LobbyChanged(lobby) => sig.lobby_changed().emit(&GString::from(&lobby)),
                 Emit::Error(msg) => sig.error().emit(&GString::from(&msg)),
             }
         }
     }
+}
+
+/// Starts a background reconnect when the agent wants one, and hands the
+/// agent the new connection when it is up.
+fn reconnect(conn: &mut Conn, now: Instant) {
+    if let Some(dialing) = &conn.dialing {
+        match dialing.try_recv() {
+            Ok(Ok((signal, _))) => {
+                conn.signal = Some(signal);
+                conn.agent.signal_reconnected(now);
+                conn.dialing = None;
+            }
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                conn.agent.reconnect_failed(now);
+                conn.dialing = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    } else if conn.signal.is_none() && conn.agent.reconnect_due(now) {
+        conn.dialing = Some(dial(conn.server.clone(), conn.trust.clone()));
+    }
+}
+
+fn pump_signal(conn: &mut Conn) -> Result<(), knockknock::Error> {
+    if let Some(signal) = &mut conn.signal {
+        signal.pump(&mut conn.agent)?;
+        if !signal.is_open() {
+            conn.signal = None;
+        }
+    }
+    Ok(())
 }
 
 /// Moves the agent's output to the network and turns its events into
@@ -371,7 +498,11 @@ fn drain(conn: &mut Conn, pending: &mut Vec<Emit>) -> Result<(), knockknock::Err
     while let Some(out) = conn.agent.poll_output() {
         match out {
             Output::Transmit { to, bytes } => transmit(conn, to, &bytes),
-            Output::Signal(bytes) => conn.signal.write(&bytes)?,
+            Output::Signal(bytes) => {
+                if let Some(signal) = &mut conn.signal {
+                    signal.write(&bytes)?;
+                }
+            }
             Output::Event(e) => on_event(conn, e, pending),
         }
     }
@@ -431,6 +562,16 @@ fn on_event(conn: &mut Conn, event: Event, pending: &mut Vec<Emit>) {
         Event::ServerError(code) if conn.host => pending.push(Emit::Error(code.to_string())),
         Event::ServerError(code) => pending.push(Emit::JoinFailed(code.to_string())),
         Event::ServerLost => pending.push(Emit::ServerLost),
+        Event::ServerRestored { lobby } => {
+            if conn.host
+                && let Some(lobby) = lobby
+                && conn.lobby.is_some_and(|old| old != lobby)
+            {
+                conn.lobby = Some(lobby);
+                pending.push(Emit::LobbyChanged(lobby.to_string()));
+            }
+            pending.push(Emit::ServerRestored);
+        }
         Event::Data { .. } => {}
     }
 }

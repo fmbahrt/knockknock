@@ -60,6 +60,7 @@ fn is_frame_type(t: u8) -> bool {
 }
 
 const FLAG_HOST: u8 = 1;
+const FLAG_RESUME: u8 = 2;
 const FLAG_NOMINATE: u8 = 1;
 
 /// A decoded UDP packet. The auth tag is checked separately against the raw
@@ -78,6 +79,10 @@ pub enum Message {
     Register {
         host: bool,
         candidates: Vec<Candidate>,
+        /// Takes back an earlier registration (client ID and secret) after a
+        /// lost connection, keeping its lobby and sessions. Safe to send:
+        /// signalling runs over TLS.
+        resume: Option<(u64, Key)>,
     },
     Registered {
         client_id: u64,
@@ -394,9 +399,24 @@ impl Message {
 
     fn encode_payload(&self, buf: &mut Vec<u8>) -> Result<(), ProtocolError> {
         match self {
-            Self::Register { host, candidates } => {
-                buf.push(if *host { FLAG_HOST } else { 0 });
+            Self::Register {
+                host,
+                candidates,
+                resume,
+            } => {
+                let mut flags = if *host { FLAG_HOST } else { 0 };
+                if resume.is_some() {
+                    flags |= FLAG_RESUME;
+                }
+                buf.push(flags);
                 put_candidates(buf, candidates)?;
+                if let Some((client_id, secret)) = resume {
+                    if *client_id == 0 {
+                        return Err(ProtocolError::BadField);
+                    }
+                    buf.extend_from_slice(&client_id.to_be_bytes());
+                    buf.extend_from_slice(secret);
+                }
             }
             Self::Registered {
                 client_id,
@@ -469,10 +489,24 @@ impl Message {
     fn decode_payload(ty: u8, payload: &[u8]) -> Result<Self, ProtocolError> {
         let mut r = Reader(payload);
         let msg = match ty {
-            TYPE_REGISTER => Self::Register {
-                host: r.u8()? & FLAG_HOST != 0,
-                candidates: r.candidates()?,
-            },
+            TYPE_REGISTER => {
+                let flags = r.u8()?;
+                let candidates = r.candidates()?;
+                let resume = if flags & FLAG_RESUME != 0 {
+                    let id = r.u64()?;
+                    if id == 0 {
+                        return Err(ProtocolError::BadField);
+                    }
+                    Some((id, r.take()?))
+                } else {
+                    None
+                };
+                Self::Register {
+                    host: flags & FLAG_HOST != 0,
+                    candidates,
+                    resume,
+                }
+            }
             TYPE_REGISTERED => Self::Registered {
                 client_id: r.u64()?,
                 secret: r.take()?,
@@ -727,6 +761,15 @@ mod tests {
                 Vector::Frame(Message::Register {
                     host: true,
                     candidates: vec![Candidate::host(addr("192.168.1.20:5000"))],
+                    resume: None,
+                }),
+            ),
+            (
+                "frame_register_resume",
+                Vector::Frame(Message::Register {
+                    host: false,
+                    candidates: vec![Candidate::host(addr("192.168.1.20:5000"))],
+                    resume: Some((CLIENT, KEY)),
                 }),
             ),
             (
@@ -862,6 +905,7 @@ mod tests {
         let reg = Message::Register {
             host: false,
             candidates: vec![],
+            resume: None,
         };
         let as_packet = Packet {
             id: 0,
