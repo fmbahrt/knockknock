@@ -6,9 +6,9 @@ reloadable = true
 [libraries]
 macos.debug = "res://addons/knockknock/bin/libknockknock_godot.dylib"
 macos.release = "res://addons/knockknock/bin/libknockknock_godot.dylib"
-linux.debug.x86_64 = "res://addons/knockknock/bin/libknockknock_godot.so"
-linux.release.x86_64 = "res://addons/knockknock/bin/libknockknock_godot.so"
-linux.debug.arm64 = "res://addons/knockknock/bin/libknockknock_godot.so"
-linux.release.arm64 = "res://addons/knockknock/bin/libknockknock_godot.so"
+linux.debug.x86_64 = "res://addons/knockknock/bin/libknockknock_godot.linux.x86_64.so"
+linux.release.x86_64 = "res://addons/knockknock/bin/libknockknock_godot.linux.x86_64.so"
+linux.debug.arm64 = "res://addons/knockknock/bin/libknockknock_godot.linux.arm64.so"
+linux.release.arm64 = "res://addons/knockknock/bin/libknockknock_godot.linux.arm64.so"
 windows.debug.x86_64 = "res://addons/knockknock/bin/knockknock_godot.dll"
 windows.release.x86_64 = "res://addons/knockknock/bin/knockknock_godot.dll"
