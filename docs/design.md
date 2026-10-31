@@ -728,6 +728,19 @@ helm install rv charts/rendezvous -n knockknock \
 kubectl get secret -n knockknock rv-rendezvous-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > godot/dev-ca.pem
 ```
 
+Publishing a GitHub release tagged `vX.Y.Z` runs `.github/workflows/release.yml`.
+It verifies the release (Go lint and tests, chart lint), builds the image for
+amd64 and arm64, and pushes it to `ghcr.io/<owner>/knockknock-rendezvous`. It
+then pushes the chart to `oci://ghcr.io/<owner>/charts/rendezvous`, with the
+image pinned by digest, and attaches the `.tgz` to the release. Both get signed
+build provenance; the image also gets an SBOM. Prereleases (`v1.2.0-rc.1`)
+don't move `latest`.
+
+```sh
+helm install rv oci://ghcr.io/<owner>/charts/rendezvous --version X.Y.Z -n knockknock -f values.yaml
+gh attestation verify oci://ghcr.io/<owner>/knockknock-rendezvous:X.Y.Z --owner <owner>
+```
+
 ### Testing data over real connections
 
 `scripts/datatest.py` starts a local server (or uses `--server`), a host and
